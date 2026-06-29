@@ -49,3 +49,5 @@ peract_test.zip
 /PyRep/
 /RLBench/
 /train_logs/
+/clip1/flax_model.msgpack
+/clip1/pytorch_model.bin
