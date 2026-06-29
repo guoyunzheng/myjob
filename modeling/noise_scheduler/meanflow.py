@@ -73,15 +73,19 @@ class MFScheduler:
             - self.prev_timesteps: 对应的下一个时间点（最后一个元素为 1.0）
             """
             # 1. 生成从 0 开始递增的序列
-        self.timesteps = torch.from_numpy(
-            np.arange(num_inference_steps).astype(np.float32)
-            / num_inference_steps
-        ).to(device)
+        # t=0 is data and t=1 is noise, so inference runs from 1 to 0.
+        self.timesteps = torch.linspace(
+            1.0,
+            1.0 / num_inference_steps,
+            num_inference_steps,
+            device=device,
+            dtype=torch.float32,
+        )
         
         # 2. 预计算 prev_timesteps（在升序中，它代表前向的下一步）：用于计算 dt = prev_t - t
         self.prev_timesteps = torch.cat((
             self.timesteps[1:],
-            torch.ones(1, device=device, dtype=self.timesteps.dtype)
+            torch.zeros(1, device=device, dtype=self.timesteps.dtype)
         ))
     def sample_noise_step(self, num_noise, device):
         """
@@ -172,8 +176,8 @@ class MFScheduler:
         vc = model_output
 
 
-        dt = r - t
-        pred_prev_sample = zt - dt * vc  # z_t'（前一步的估计）
+        dt = t - r
+        pred_prev_sample = zt - dt * vc
 
         return DummyClass(prev_sample=pred_prev_sample)
 

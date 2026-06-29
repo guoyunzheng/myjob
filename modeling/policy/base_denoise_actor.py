@@ -126,13 +126,19 @@ class DenoiseActor(nn.Module):
 
         timesteps = self.position_scheduler.timesteps
         prev_timesteps = self.position_scheduler.prev_timesteps
-        for  idx, r in enumerate(timesteps):
+        batch_size = len(trajectory)
+        for t, r in zip(timesteps, prev_timesteps):
             # 条件分支
-            t = prev_timesteps[idx]
+            r_batch = torch.full(
+                (batch_size,), r.item(), device=device, dtype=trajectory.dtype
+            )
+            t_batch = torch.full(
+                (batch_size,), t.item(), device=device, dtype=trajectory.dtype
+            )
             out_cond = self.policy_forward_pass(
                 trajectory,
-                t * torch.ones(len(trajectory)).to(device).long(),
-                r * torch.ones(len(trajectory)).to(device).long(),
+                r_batch,
+                t_batch,
                 fixed_inputs
             )
             out_cond = out_cond[-1]
@@ -152,8 +158,8 @@ class DenoiseActor(nn.Module):
 
                 out_uncond = self.policy_forward_pass(
                     trajectory,
-                    t * torch.ones(len(trajectory)).to(device).long(),
-                    r * torch.ones(len(trajectory)).to(device).long(),
+                    r_batch,
+                    t_batch,
                     uncond_fixed_inputs
                 )
                 out_uncond = out_uncond[-1]
@@ -161,7 +167,7 @@ class DenoiseActor(nn.Module):
 
             pos = self.position_scheduler.step(
                 out[..., :3],
-                t, r,trajectory[..., :3]
+                t, r, trajectory[..., :3]
             ).prev_sample
             rot = self.rotation_scheduler.step(
                 out[..., 3:-1],
@@ -225,27 +231,18 @@ class DenoiseActor(nn.Module):
                 num_noise=len(noise), device=noise.device
             )
             eps = 1e-4
-            t_next = (t + eps).clamp(max=1.0)
-            r_next = (r + eps).clamp(max=1.0)
+            
+
             pos = self.position_scheduler.add_noise(gt_trajectory[..., :3], noise[..., :3], t)
             rot = self.rotation_scheduler.add_noise(gt_trajectory[..., 3:], noise[..., 3:], t)
             noisy_trajectory = torch.cat((pos, rot), -1) # 并不对应at
             v = noise - gt_trajectory  # velocity target
             z = noisy_trajectory.clone().requires_grad_(True)
-            r_var = r.clone().detach().requires_grad_(False)
-            t_var = t.clone().detach().requires_grad_(True)
-            # pos_next = self.position_scheduler.add_noise(gt_trajectory[..., :3], noise[..., :3], t_next)
-            # rot_next = self.rotation_scheduler.add_noise(gt_trajectory[..., 3:], noise[..., 3:], t_next) # 修正旋转
-            # z_next = torch.cat((pos_next, rot_next), -1)
-            z_next=z+v*eps
             pred= self.policy_forward_pass(z, r, t, fixed_inputs)
-            u_t = pred[-1][..., :9]
-            z_last=z-v*eps
-            t_last = (t - eps).clamp(min=0.0)
-            r_last = (r - eps).clamp(min=0.0)
             
-          
-          
+            t_next = (t + eps).clamp(max=1.0)
+            t_last = (t - eps).clamp(min=0.0)
+
             # def u_fn(z_in, r_in, t_in):
             #     out = self.policy_forward_pass(z_in, r_in, t_in, fixed_inputs)
             #     out = out[-1]
@@ -253,8 +250,7 @@ class DenoiseActor(nn.Module):
 
             # zeros_r = torch.zeros_like(r_var)
             # ones_t = torch.ones_like(t_var)
-            rlast=self.policy_forward_pass(z, r_last, t, fixed_inputs)[-1][..., :9]
-            rnext=self.policy_forward_pass(z, r_last, t, fixed_inputs)[-1][..., :9]
+
             u_next_z = self.policy_forward_pass(z, r, t_next, fixed_inputs)[-1][..., :9]
             u_last=self.policy_forward_pass(z, r, t_last, fixed_inputs)[-1][..., :9]
             # with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
@@ -273,12 +269,6 @@ class DenoiseActor(nn.Module):
             u_ivc_pred = pred_ivc_list[-1][..., :9]
             loss_ivc =F.mse_loss(u_ivc_pred, v) 
             
-            # pred_list=self.policy_forward_pass(noisy_trajectory,t,r,fixed_inputs)
-            # u_oldpred=pred_list[-1][...,: 9].detach()
-            # a_r=(noisy_trajectory+(r-t)*u_oldpred).detach()
-            # pred_list2=(self.policy_forward_pass(a_r.detach(),r,r,fixed_inputs)).detach()
-            # u_oldpred2=pred_list2[-1][...,: 9].detach()
-            # loss_ivc2=F.mse_loss(u_oldpred2,u_r)
         
             for layer_pred in pred:
                 u_pred = layer_pred[..., :9]
@@ -287,7 +277,7 @@ class DenoiseActor(nn.Module):
                 
                 openess = layer_pred[..., -1:]
                 loss = loss_u + loss_rot + F.binary_cross_entropy_with_logits(openess, gt_openess)
-                total_loss = total_loss + loss
+                total_loss = total_loss + 0.5*loss_ivc+loss
             return total_loss
     
     def normalize_pos(self, signal):
