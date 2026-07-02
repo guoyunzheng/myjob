@@ -418,7 +418,10 @@ class BaseTrainTester:
             for key, value in values.items():
                 print(f"{key}: {value:.03f}")
 
-        return -values[f'{split}-losses/mean/traj_pos_acc_001']
+        # Lower is considered better by save_checkpoint(). Negating joint
+        # success therefore selects the checkpoint whose position, rotation,
+        # and gripper prediction are simultaneously correct most often.
+        return -values[f'{split}-losses/mean/traj_joint_success']
 
     def load_checkpoint(self, model, ema_model, optimizer):
         """Load from checkpoint."""
@@ -451,6 +454,13 @@ class BaseTrainTester:
             optimizer.load_state_dict(model_dict["optimizer"])
         start_iter = model_dict.get("iter", 0)
         best_loss = model_dict.get("best_loss", None)
+        if model_dict.get("best_metric") != "traj_joint_success":
+            if best_loss is not None:
+                print(
+                    "Best-checkpoint metric changed to traj_joint_success; "
+                    "resetting the previous best value."
+                )
+            best_loss = None
 
         print("=> loaded successfully '{}' (step {})".format(
             self.args.checkpoint, model_dict.get("iter", 0)
@@ -472,7 +482,8 @@ class BaseTrainTester:
                 "weight": model_state,
                 "ema_weight": ema_state,
                 "iter": step_id + 1,
-                "best_loss": best_loss
+                "best_loss": best_loss,
+                "best_metric": "traj_joint_success"
             }, self.args.log_dir / "best.pth")
 
         # Last checkpoint (always saved)
@@ -481,7 +492,8 @@ class BaseTrainTester:
             "ema_weight": ema_state,
             "optimizer": optimizer.state_dict(),
             "iter": step_id + 1,
-            "best_loss": best_loss
+            "best_loss": best_loss,
+            "best_metric": "traj_joint_success"
         }, self.args.log_dir / "last.pth")
 
         # Save intermediate checkpoints
@@ -490,7 +502,8 @@ class BaseTrainTester:
                 "weight": model_state,
                 "ema_weight": ema_state,
                 "iter": step_id + 1,
-                "best_loss": best_loss
+                "best_loss": best_loss,
+                "best_metric": "traj_joint_success"
             }, self.args.log_dir / f"interm{step_id + 1}.pth")
 
         return best_loss
