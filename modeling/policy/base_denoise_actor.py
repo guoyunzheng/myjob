@@ -126,19 +126,20 @@ class DenoiseActor(nn.Module):
 
         timesteps = self.position_scheduler.timesteps
         prev_timesteps = self.position_scheduler.prev_timesteps
-        batch_size = len(trajectory)
-        for t, r in zip(timesteps, prev_timesteps):
+
+        for idx, t in enumerate(timesteps):
             # 条件分支
-            r_batch = torch.full(
-                (batch_size,), r.item(), device=device, dtype=trajectory.dtype
-            )
-            t_batch = torch.full(
-                (batch_size,), t.item(), device=device, dtype=trajectory.dtype
+            r = prev_timesteps[idx]
+            out_cond = self.policy_forward_pass(
+                trajectory,
+                r * torch.ones(len(trajectory)).to(device).long(),
+                t * torch.ones(len(trajectory)).to(device).long(),
+                fixed_inputs
             )
             out_cond = self.policy_forward_pass(
                 trajectory,
-                r_batch,
-                t_batch,
+                r * torch.ones(len(trajectory)).to(device).long(),
+                t * torch.ones(len(trajectory)).to(device).long(),
                 fixed_inputs
             )
             out_cond = out_cond[-1]
@@ -158,8 +159,8 @@ class DenoiseActor(nn.Module):
 
                 out_uncond = self.policy_forward_pass(
                     trajectory,
-                    r_batch,
-                    t_batch,
+                    r * torch.ones(len(trajectory)).to(device).long(),
+                    t * torch.ones(len(trajectory)).to(device).long(),
                     uncond_fixed_inputs
                 )
                 out_uncond = out_uncond[-1]
@@ -167,11 +168,11 @@ class DenoiseActor(nn.Module):
 
             pos = self.position_scheduler.step(
                 out[..., :3],
-                t, r, trajectory[..., :3]
+                r,t, trajectory[..., :3]
             ).prev_sample
             rot = self.rotation_scheduler.step(
                 out[..., 3:-1],
-                t, r,  trajectory[..., 3:]
+                r, t,  trajectory[..., 3:]
             ).prev_sample
             trajectory = torch.cat((pos, rot), -1)
 

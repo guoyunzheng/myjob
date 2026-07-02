@@ -154,7 +154,7 @@ class MFScheduler:
         zt = (1 - texp) * x + texp * z1
         return zt.to(x.dtype)
 
-    def step(self, model_output, t,r, sample):
+    def step(self, model_output, r,t, sample):
         """
         单步求解（采样阶段使用）：
 
