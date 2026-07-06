@@ -8,13 +8,6 @@ def compute_metrics(pred, gt):
     quat_l1 = (select_mask * quat_l1 + (1 - select_mask) * quat_l1_)
     # gripper openess
     openess = ((pred[..., -1:] >= 0.5) == (gt[..., -1:] >= 0.5)).bool()
-    # A rollout action is useful only when position, rotation, and gripper
-    # state are all correct for the same trajectory element.
-    joint_success = (
-        (pos_l2 < 0.01)
-        & (quat_l1 < 0.025)
-        & openess.squeeze(-1)
-    )
     tr = 'traj_'
 
     # Trajectory metrics
@@ -23,14 +16,12 @@ def compute_metrics(pred, gt):
         tr + 'pos_acc_001': (pos_l2 < 0.01).float().mean(),
         tr + 'rot_l1': quat_l1.mean(),
         tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(),
-        tr + 'gripper': openess.flatten().float().mean(),
-        tr + 'joint_success': joint_success.float().mean()
+        tr + 'gripper': openess.flatten().float().mean()
     }, {
         tr + 'pos_l2': pos_l2.mean(-1),
         tr + 'pos_acc_001': (pos_l2 < 0.01).float().mean(-1),
         tr + 'rot_l1': quat_l1.mean(-1),
-        tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(-1),
-        tr + 'joint_success': joint_success.float().mean(-1)
+        tr + 'rot_acc_0025': (quat_l1 < 0.025).float().mean(-1)
     }
 
     return ret_1, ret_2
