@@ -258,8 +258,8 @@ class DenoiseActor(nn.Module):
             delta = (r - t).view([t.size(0)] + [1] * (dudt_approx.dim() - 1))
             u_tgt = (v + delta * dudt_approx).detach()
 
-            delta= (r - t).view([t.size(0)] + [1] * (dudt_approx.dim() - 1))
-            u_tgt = (v + delta * dudt_approx).detach()
+            # delta= (r - t).view([t.size(0)] + [1] * (dudt.dim() - 1))
+            # u_tgt = (v + delta * dudt).detach()
             
             pred_ivc_list = self.policy_forward_pass(noisy_trajectory, t, t, fixed_inputs)#换成t试一下
             u_ivc_pred = pred_ivc_list[-1][..., :9]
