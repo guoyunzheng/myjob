@@ -132,14 +132,8 @@ class DenoiseActor(nn.Module):
             r = prev_timesteps[idx]
             out_cond = self.policy_forward_pass(
                 trajectory,
-                r * torch.ones(len(trajectory)).to(device).long(),
-                t * torch.ones(len(trajectory)).to(device).long(),
-                fixed_inputs
-            )
-            out_cond = self.policy_forward_pass(
-                trajectory,
-                r * torch.ones(len(trajectory)).to(device).long(),
-                t * torch.ones(len(trajectory)).to(device).long(),
+                r * torch.ones(len(trajectory), device=device),
+                t * torch.ones(len(trajectory), device=device),
                 fixed_inputs
             )
             out_cond = out_cond[-1]
@@ -159,8 +153,8 @@ class DenoiseActor(nn.Module):
 
                 out_uncond = self.policy_forward_pass(
                     trajectory,
-                    r * torch.ones(len(trajectory)).to(device).long(),
-                    t * torch.ones(len(trajectory)).to(device).long(),
+                    r * torch.ones(len(trajectory), device=device),
+                    t * torch.ones(len(trajectory), device=device),
                     uncond_fixed_inputs
                 )
                 out_uncond = out_uncond[-1]
@@ -201,30 +195,28 @@ class DenoiseActor(nn.Module):
         return trajectory
 
     def compute_loss(self, gt_trajectory, rgb3d, rgb2d, pcd, instruction, proprio):
-    
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):#此处可能需要关掉
-            fixed_inputs = self.encode_inputs(rgb3d, rgb2d, pcd, instruction, proprio)
+        fixed_inputs = self.encode_inputs(rgb3d, rgb2d, pcd, instruction, proprio)
 
-            if self.cond_mask_prob > 0:
-                fixed_inputs_list = list(fixed_inputs)
-                instr_feats = fixed_inputs_list[5]
-                instr_pos = fixed_inputs_list[6]
-                if torch.rand(1) < self.cond_mask_prob:
-                    instr_feats = torch.zeros_like(instr_feats)
-                    instr_pos = torch.zeros_like(instr_pos)
-                    fixed_inputs_list[5] = instr_feats 
-                    fixed_inputs_list[6] = instr_pos 
-                fixed_inputs = tuple(fixed_inputs_list)
+        if self.cond_mask_prob > 0:
+            fixed_inputs_list = list(fixed_inputs)
+            instr_feats = fixed_inputs_list[5]
+            instr_pos = fixed_inputs_list[6]
+            if torch.rand(1) < self.cond_mask_prob:
+                instr_feats = torch.zeros_like(instr_feats)
+                instr_pos = torch.zeros_like(instr_pos)
+                fixed_inputs_list[5] = instr_feats 
+                fixed_inputs_list[6] = instr_pos 
+            fixed_inputs = tuple(fixed_inputs_list)
 
-            gt_openess = gt_trajectory[..., -1:]
-            gt_trajectory = gt_trajectory[..., :-1]
-            gt_trajectory = self.normalize_pos(gt_trajectory)
-            _, traj_len, nhand, _ = gt_trajectory.shape
-            gt_trajectory = self.convert_rot(
-                gt_trajectory.flatten(1, 2)
-            ).unflatten(1, (traj_len, nhand))
-            
-            total_loss = 0
+        gt_openess = gt_trajectory[..., -1:]
+        gt_trajectory = gt_trajectory[..., :-1]
+        gt_trajectory = self.normalize_pos(gt_trajectory)
+        _, traj_len, nhand, _ = gt_trajectory.shape
+        gt_trajectory = self.convert_rot(
+            gt_trajectory.flatten(1, 2)
+        ).unflatten(1, (traj_len, nhand))
+        
+        total_loss = 0
         for _ in range(self._lv2_batch_size):
             # torch.cuda.empty_cache()
             noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
@@ -248,12 +240,12 @@ class DenoiseActor(nn.Module):
             #     out = self.policy_forward_pass(z_in, r_in, t_in, fixed_inputs)
             #     out = out[-1]
             #     return out[..., :9].float()
-
-            # zeros_r = torch.zeros_like(r_var)
-            # ones_t = torch.ones_like(t_var)
+            # zeros_r = torch.zeros_like(r)
+            # ones_t = torch.ones_like(t)
 
             u_next_z = self.policy_forward_pass(z, r, t_next, fixed_inputs)[-1][..., :9]
             u_last=self.policy_forward_pass(z, r, t_last, fixed_inputs)[-1][..., :9]
+
             # with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
             #     _, dudt = jvp(u_fn, (z, r, t), (v, zeros_r, ones_t))
             #     # _, dudr = jvp(u_fn, (z_f32, r_f32, t_f32), (torch.zeros_like(z_f32), torch.ones_like(r_f32), torch.zeros_like(t_f32)))
@@ -261,11 +253,14 @@ class DenoiseActor(nn.Module):
             # u_next_t = self.policy_forward_pass(z, r, t_next, fixed_inputs)[-1][..., :9]
             # dudt_z=(u_next_z-u_t)/eps
             # dudt_t = (u_next_t - u_t) / eps
+
             dudt_approx=(u_next_z-u_last)/(2*eps)
             delta = (r - t).view([t.size(0)] + [1] * (dudt_approx.dim() - 1))
             u_tgt = (v + delta * dudt_approx).detach()
-            # u_r=(v+delta*(dudt+dudr)).detach()
 
+            delta= (r - t).view([t.size(0)] + [1] * (dudt_approx.dim() - 1))
+            u_tgt = (v + delta * dudt_approx).detach()
+            
             pred_ivc_list = self.policy_forward_pass(noisy_trajectory, t, t, fixed_inputs)#换成t试一下
             u_ivc_pred = pred_ivc_list[-1][..., :9]
             loss_ivc =F.mse_loss(u_ivc_pred, v) 
@@ -278,8 +273,9 @@ class DenoiseActor(nn.Module):
                 
                 openess = layer_pred[..., -1:]
                 loss = loss_u + loss_rot + F.binary_cross_entropy_with_logits(openess, gt_openess)
-                total_loss = total_loss + 0.5*loss_ivc+loss
-            return total_loss
+                total_loss = total_loss +loss
+            total_loss=total_loss+ 0.5*loss_ivc
+        return total_loss/self._lv2_batch_size
     
     def normalize_pos(self, signal):
         _min = self.workspace_normalizer[0]
