@@ -46,6 +46,8 @@ def parse_arguments():
         ('num_history', int, 0),
         # Model arguments: head
         ('num_shared_attn_layers', int, 4),
+        ('action_hidden_dim', int, 256),
+        ('action_num_blocks', int, 6),
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_xyzw'),
         ('denoise_timesteps', int, 10),
@@ -70,6 +72,8 @@ def load_models(args):
         nhist=args.num_history,
         nhand=2 if args.bimanual else 1,
         num_shared_attn_layers=args.num_shared_attn_layers,
+        action_hidden_dim=args.action_hidden_dim,
+        action_num_blocks=args.action_num_blocks,
         relative=args.relative_action,
         rotation_format=args.rotation_format,
         denoise_timesteps=args.denoise_timesteps,

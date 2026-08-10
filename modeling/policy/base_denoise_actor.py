@@ -2,7 +2,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 import einops
-import torch.backends
 from torch.func import jvp
 from ..noise_scheduler import fetch_schedulers
 from ..utils.layers import AttentionModule
@@ -14,7 +13,6 @@ from ..utils.utils import (
     matrix_to_quaternion,
     quaternion_to_matrix
 )
-from torch.cuda.amp import autocast
 
 class DenoiseActor(nn.Module):
     def __init__(self,
@@ -31,27 +29,34 @@ class DenoiseActor(nn.Module):
                  denoise_timesteps=5,
                  denoise_model="meanflow",  
                  # Training arguments
-                 lv2_batch_size=4):
+                 lv2_batch_size=4,
+                 action_hidden_dim=256,
+                 action_num_blocks=6,
+                 jvp_microbatch_size=8):
         super().__init__()
         # Arguments to be accessed by the main class
         self._rotation_format = rotation_format
         self._relative = relative
         self._lv2_batch_size = lv2_batch_size
+        self._jvp_microbatch_size = jvp_microbatch_size
 
         # Vision-language encoder, runs only once
         self.encoder = None  # Implement this!
         self.cond_mask_prob = 0.1
-        # Action decoder, runs at every denoising timestep
-        self.traj_encoder = nn.Linear(
-            6 if rotation_format == 'euler' else 9,  # XYZ + Euler or 6D
-            embedding_dim
-        )
-        self.prediction_head = TransformerHead(
+        # The observation encoder may keep using attention/Flash Attention.
+        # Only this compact, deterministic action decoder is traversed by JVP.
+        action_dim = 6 if rotation_format == 'euler' else 9
+        self.condition_pooler = ConditionPooler(
             embedding_dim=embedding_dim,
-            nhist=nhist * nhand,
-            num_attn_heads=num_attn_heads,
-            num_shared_attn_layers=num_shared_attn_layers,
-            rot_dim=3 if rotation_format == 'euler' else 6
+            condition_dim=action_hidden_dim,
+        )
+        self.prediction_head = FiLMTemporalConvHead(
+            action_dim=action_dim,
+            hidden_dim=action_hidden_dim,
+            condition_dim=action_hidden_dim,
+            num_blocks=action_num_blocks,
+            nhand=nhand,
+            rot_dim=3 if rotation_format == 'euler' else 6,
         )
 
         # Noise/denoise schedulers and hyperparameters
@@ -82,8 +87,8 @@ class DenoiseActor(nn.Module):
         query_trajectory = proprio[:, -1:]
         return (query_trajectory,) + fixed_inputs
 
-    def policy_forward_pass(self, trajectory, timestep1, timestep2, fixed_inputs):
-        # Parse inputs
+    def encode_condition(self, fixed_inputs):
+        """Pool observation tokens once, outside the action-head JVP path."""
         (
             query_trajectory,
             rgb3d_feats, pcd,
@@ -93,31 +98,26 @@ class DenoiseActor(nn.Module):
             fps_scene_feats, fps_scene_pos
         ) = fixed_inputs
 
-        # Get features from normalized (relative) trajectory
-        trajectory_feats = self.traj_encoder(trajectory)
-
-        # But use positions from unnormalized absolute trajectory
-        traj_xyz = self.unnormalize_pos(trajectory)[..., :3]
-        if self._relative:  # relative to absolute
-            traj_xyz = (
-                query_trajectory[..., :3]
-                + torch.cumsum(traj_xyz, dim=1)
-            )
-
-        return self.prediction_head(
-            trajectory_feats,
-            traj_xyz,
-            timestep1,
-            timestep2,
+        return self.condition_pooler(
             rgb3d_feats=rgb3d_feats,
             rgb3d_pos=pcd,
             rgb2d_feats=rgb2d_feats,
             rgb2d_pos=rgb2d_pos,
             instr_feats=instr_feats,
-            instr_pos=instr_pos,
             proprio_feats=proprio_feats,
             fps_scene_feats=fps_scene_feats,
-            fps_scene_pos=fps_scene_pos
+            fps_scene_pos=fps_scene_pos,
+        )
+
+    def policy_forward_pass(self, trajectory, timestep1, timestep2, condition):
+        # Accept the old fixed-input tuple as a convenience for external callers.
+        if not torch.is_tensor(condition):
+            condition = self.encode_condition(condition)
+        return self.prediction_head(
+            trajectory,
+            timestep1,
+            timestep2,
+            condition,
         )
 
     def conditional_sample(self, trajectory, device, fixed_inputs, guidance_scale=2.0, uncond_inputs=None):
@@ -126,47 +126,55 @@ class DenoiseActor(nn.Module):
 
         timesteps = self.position_scheduler.timesteps
         prev_timesteps = self.position_scheduler.prev_timesteps
+        condition = self.encode_condition(fixed_inputs)
+
+        uncond_condition = None
+        if guidance_scale != 1.0:
+            if uncond_inputs is None:
+                uncond_fixed_inputs = list(fixed_inputs)
+                if len(uncond_fixed_inputs) > 5 and uncond_fixed_inputs[5] is not None:
+                    uncond_fixed_inputs[5] = torch.zeros_like(uncond_fixed_inputs[5])
+                if len(uncond_fixed_inputs) > 6 and uncond_fixed_inputs[6] is not None:
+                    uncond_fixed_inputs[6] = torch.zeros_like(uncond_fixed_inputs[6])
+                uncond_fixed_inputs = tuple(uncond_fixed_inputs)
+            else:
+                uncond_fixed_inputs = uncond_inputs
+            uncond_condition = (
+                uncond_fixed_inputs
+                if torch.is_tensor(uncond_fixed_inputs)
+                else self.encode_condition(uncond_fixed_inputs)
+            )
 
         for idx, t in enumerate(timesteps):
             # 条件分支
             r = prev_timesteps[idx]
             out_cond = self.policy_forward_pass(
                 trajectory,
+                r * torch.ones(len(trajectory), device=device),
                 t * torch.ones(len(trajectory), device=device),
-                t * torch.ones(len(trajectory), device=device),
-                fixed_inputs
+                condition,
             )
             out_cond = out_cond[-1]
 
             if guidance_scale == 1.0:
                 out = out_cond
             else:
-                if uncond_inputs is None:
-                    uncond_fixed_inputs = list(fixed_inputs)
-                    if len(uncond_fixed_inputs) > 5 and uncond_fixed_inputs[5] is not None:
-                        uncond_fixed_inputs[5] = torch.zeros_like(uncond_fixed_inputs[5])
-                    if len(uncond_fixed_inputs) > 6 and uncond_fixed_inputs[6] is not None:
-                        uncond_fixed_inputs[6] = torch.zeros_like(uncond_fixed_inputs[6])
-                    uncond_fixed_inputs = tuple(uncond_fixed_inputs)
-                else:
-                    uncond_fixed_inputs = uncond_inputs
-
                 out_uncond = self.policy_forward_pass(
                     trajectory,
+                    r * torch.ones(len(trajectory), device=device),
                     t * torch.ones(len(trajectory), device=device),
-                    t * torch.ones(len(trajectory), device=device),
-                    uncond_fixed_inputs
+                    uncond_condition,
                 )
                 out_uncond = out_uncond[-1]
                 out = out_uncond + guidance_scale * (out_cond - out_uncond)
 
             pos = self.position_scheduler.step(
                 out[..., :3],
-                r,t, trajectory[..., :3]
+                t, r, trajectory[..., :3]
             ).prev_sample
             rot = self.rotation_scheduler.step(
                 out[..., 3:-1],
-                r, t,  trajectory[..., 3:]
+                t, r, trajectory[..., 3:]
             ).prev_sample
             trajectory = torch.cat((pos, rot), -1)
 
@@ -195,82 +203,141 @@ class DenoiseActor(nn.Module):
         return trajectory
 
     def compute_loss(self, gt_trajectory, rgb3d, rgb2d, pcd, instruction, proprio):
-        fixed_inputs = self.encode_inputs(rgb3d, rgb2d, pcd, instruction, proprio)
+        fixed_inputs = self.encode_inputs(
+            rgb3d, rgb2d, pcd, instruction, proprio
+        )
 
+        # Classifier-free condition masking is sampled once, before both the
+        # target and prediction forwards, so all MeanFlow evaluations see the
+        # same condition.
         if self.cond_mask_prob > 0:
             fixed_inputs_list = list(fixed_inputs)
-            instr_feats = fixed_inputs_list[5]
-            instr_pos = fixed_inputs_list[6]
-            if torch.rand(1) < self.cond_mask_prob:
-                instr_feats = torch.zeros_like(instr_feats)
-                instr_pos = torch.zeros_like(instr_pos)
-                fixed_inputs_list[5] = instr_feats 
-                fixed_inputs_list[6] = instr_pos 
+            if torch.rand((), device=gt_trajectory.device) < self.cond_mask_prob:
+                fixed_inputs_list[5] = torch.zeros_like(fixed_inputs_list[5])
+                fixed_inputs_list[6] = torch.zeros_like(fixed_inputs_list[6])
             fixed_inputs = tuple(fixed_inputs_list)
 
+        # Pool observation features once. Only the compact action head below
+        # participates in JVP; the attention-based encoder stays outside it.
+        condition = self.encode_condition(fixed_inputs)
+
         gt_openess = gt_trajectory[..., -1:]
-        gt_trajectory = gt_trajectory[..., :-1]
-        gt_trajectory = self.normalize_pos(gt_trajectory)
+        gt_trajectory = self.normalize_pos(gt_trajectory[..., :-1])
         _, traj_len, nhand, _ = gt_trajectory.shape
         gt_trajectory = self.convert_rot(
             gt_trajectory.flatten(1, 2)
         ).unflatten(1, (traj_len, nhand))
-        
+
         total_loss = 0
         for _ in range(self._lv2_batch_size):
-            # torch.cuda.empty_cache()
-            noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
+            noise = torch.randn_like(gt_trajectory)
             t, r = self.position_scheduler.sample_noise_step(
                 num_noise=len(noise), device=noise.device
             )
-            eps = 1e-4
-            
 
-            pos = self.position_scheduler.add_noise(gt_trajectory[..., :3], noise[..., :3], t)
-            rot = self.rotation_scheduler.add_noise(gt_trajectory[..., 3:], noise[..., 3:], t)
-            noisy_trajectory = torch.cat((pos, rot), -1) # 并不对应at
-            v = noise - gt_trajectory  # velocity target
-            z = noisy_trajectory.clone().requires_grad_(True)
-            pred= self.policy_forward_pass(z, r, t, fixed_inputs)
-            
-            t_next = (t + eps).clamp(max=1.0)
-            t_last = (t - eps).clamp(min=0.0)
+            pos = self.position_scheduler.add_noise(
+                gt_trajectory[..., :3], noise[..., :3], t
+            )
+            rot = self.rotation_scheduler.add_noise(
+                gt_trajectory[..., 3:], noise[..., 3:], t
+            )
+            noisy_trajectory = torch.cat((pos, rot), dim=-1)
+            velocity = noise - gt_trajectory
 
-            # def u_fn(z_in, r_in, t_in):
-            #     out = self.policy_forward_pass(z_in, r_in, t_in, fixed_inputs)
-            #     out = out[-1]
-            #     return out[..., :9].float()
-            # zeros_r = torch.zeros_like(r)
-            # ones_t = torch.ones_like(t)
+            u_target = self.compute_meanflow_target(
+                noisy_trajectory,
+                r,
+                t,
+                velocity,
+                condition.detach(),
+            )
 
-            u_next_z = self.policy_forward_pass(z, r, t_next, fixed_inputs)[-1][..., :9]
-            u_last=self.policy_forward_pass(z, r, t_last, fixed_inputs)[-1][..., :9]
+            prediction = self.policy_forward_pass(
+                noisy_trajectory, r, t, condition
+            )
+            ivc_mask = torch.isclose(r, t)
 
-            # with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
-            #     _, dudt = jvp(u_fn, (z, r, t), (v, zeros_r, ones_t))
-            #     # _, dudr = jvp(u_fn, (z_f32, r_f32, t_f32), (torch.zeros_like(z_f32), torch.ones_like(r_f32), torch.zeros_like(t_f32)))
-            #尝试计算完一个再算另一个
+            for layer_prediction in prediction:
+                u_prediction = layer_prediction[..., :-1].float()
+                loss_position = 30 * F.l1_loss(
+                    u_prediction[..., :3],
+                    u_target[..., :3],
+                    reduction='mean',
+                )
+                loss_rotation = 10 * F.l1_loss(
+                    u_prediction[..., 3:],
+                    u_target[..., 3:],
+                    reduction='mean',
+                )
+                loss_openess = F.binary_cross_entropy_with_logits(
+                    layer_prediction[..., -1:].float(),
+                    gt_openess.float(),
+                )
+                ivc_per_sample = (
+                    u_prediction - velocity.float()
+                ).square().flatten(1).mean(1)
+                ivc_weights = ivc_mask.to(dtype=ivc_per_sample.dtype)
+                loss_ivc = (
+                    ivc_per_sample * ivc_weights
+                ).sum() / ivc_weights.sum().clamp_min(1)
+                total_loss = (
+                    total_loss
+                    + loss_position
+                    + loss_rotation
+                    + loss_openess
+                    + 0.5 * loss_ivc
+                )
 
-            dudt_approx=(u_next_z-u_last)/(2*eps)
-            delta = (r - t).view([t.size(0)] + [1] * (dudt_approx.dim() - 1))
-            u_tgt = (v + delta * dudt_approx).detach()
+        return total_loss / self._lv2_batch_size
 
-            pred_ivc_list = self.policy_forward_pass(noisy_trajectory, t, t, fixed_inputs)#换成t试一下
-            u_ivc_pred = pred_ivc_list[-1][..., :9]
-            loss_ivc =F.mse_loss(u_ivc_pred, v) 
-            
-        
-            for layer_pred in pred:
-                u_pred = layer_pred[..., :9]
-                loss_u = 30 * F.l1_loss(u_pred[..., :3], u_tgt[..., :3], reduction='mean')
-                loss_rot = 10 * F.l1_loss(u_pred[..., 3:9], u_tgt[..., 3:], reduction='mean')
-                
-                openess = layer_pred[..., -1:]
-                loss = loss_u + loss_rot + F.binary_cross_entropy_with_logits(openess, gt_openess)
-                total_loss = total_loss +loss
-            total_loss=total_loss+ 0.5*loss_ivc
-        return total_loss/self._lv2_batch_size
-    
+    def compute_meanflow_target(self, z, r, t, velocity, condition):
+        """Construct the stop-gradient target using the exact MeanFlow JVP.
+
+        The characteristic direction is ``(dz, dr, dt) = (velocity, 0, 1)``.
+        Chunking applies only to the target computation; the trainable forward
+        above still uses the complete optimizer batch.
+        """
+        batch_size = z.shape[0]
+        chunk_size = self._jvp_microbatch_size
+        if chunk_size is None or chunk_size <= 0:
+            chunk_size = batch_size
+
+        directional_derivatives = []
+        with torch.no_grad():
+            for start in range(0, batch_size, chunk_size):
+                end = min(start + chunk_size, batch_size)
+                z_chunk = z[start:end]
+                r_chunk = r[start:end]
+                t_chunk = t[start:end]
+                velocity_chunk = velocity[start:end]
+                condition_chunk = condition[start:end]
+
+                def action_field(z_in, r_in, t_in):
+                    return self.policy_forward_pass(
+                        z_in, r_in, t_in, condition_chunk
+                    )[-1][..., :-1]
+
+                _, derivative = jvp(
+                    action_field,
+                    (z_chunk, r_chunk, t_chunk),
+                    (
+                        velocity_chunk,
+                        torch.zeros_like(r_chunk),
+                        torch.ones_like(t_chunk),
+                    ),
+                )
+                directional_derivatives.append(derivative)
+
+        total_derivative = torch.cat(
+            directional_derivatives, dim=0
+        ).float()
+        delta = (r - t).view(
+            [t.size(0)] + [1] * (total_derivative.dim() - 1)
+        ).float()
+        return (
+            velocity.float() + delta * total_derivative
+        ).detach()
+
     def normalize_pos(self, signal):
         _min = self.workspace_normalizer[0]
         _max = self.workspace_normalizer[1]
@@ -387,6 +454,224 @@ class DenoiseActor(nn.Module):
             gt_trajectory,
             rgb3d, rgb2d, pcd, instruction, proprio
         )
+
+
+class ConditionPooler(nn.Module):
+    """Attention-free pooling from encoder tokens to one condition vector."""
+
+    def __init__(self, embedding_dim=128, condition_dim=256):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.position_projection = nn.Sequential(
+            nn.Linear(3, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
+        self.token_norm = nn.LayerNorm(embedding_dim)
+
+        # mean + max pooling for each of: dense scene, sampled scene, 2D
+        # scene, language and proprioception.
+        pooled_dim = 10 * embedding_dim
+        self.output_projection = nn.Sequential(
+            nn.LayerNorm(pooled_dim),
+            nn.Linear(pooled_dim, 2 * condition_dim),
+            nn.SiLU(),
+            nn.Linear(2 * condition_dim, condition_dim),
+            nn.LayerNorm(condition_dim),
+        )
+
+    def _pool_tokens(self, tokens, positions, reference):
+        if tokens is None or tokens.shape[1] == 0:
+            return reference.new_zeros(
+                reference.shape[0], 2 * self.embedding_dim
+            )
+
+        if positions is not None:
+            position_features = self.position_projection(positions)
+            tokens = tokens + position_features.to(dtype=tokens.dtype)
+        tokens = self.token_norm(tokens)
+        return torch.cat(
+            (tokens.mean(dim=1), tokens.amax(dim=1)), dim=-1
+        )
+
+    def forward(
+        self,
+        rgb3d_feats,
+        rgb3d_pos,
+        rgb2d_feats,
+        rgb2d_pos,
+        instr_feats,
+        proprio_feats,
+        fps_scene_feats,
+        fps_scene_pos,
+    ):
+        reference = rgb3d_feats
+        pooled_features = [
+            self._pool_tokens(rgb3d_feats, rgb3d_pos, reference),
+            self._pool_tokens(
+                fps_scene_feats, fps_scene_pos, reference
+            ),
+            self._pool_tokens(rgb2d_feats, rgb2d_pos, reference),
+            self._pool_tokens(instr_feats, None, reference),
+            self._pool_tokens(proprio_feats, None, reference),
+        ]
+        return self.output_projection(torch.cat(pooled_features, dim=-1))
+
+
+class FiLMResidualConvBlock(nn.Module):
+    """Deterministic Conv1D block with per-sample FiLM modulation."""
+
+    def __init__(self, hidden_dim, condition_dim, dilation=1):
+        super().__init__()
+        groups = min(8, hidden_dim)
+        while hidden_dim % groups != 0:
+            groups -= 1
+
+        self.norm1 = nn.GroupNorm(groups, hidden_dim)
+        self.norm2 = nn.GroupNorm(groups, hidden_dim)
+        self.conv1 = nn.Conv1d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+        )
+        self.conv2 = nn.Conv1d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=3,
+            padding=dilation,
+            dilation=dilation,
+        )
+        self.film = nn.Linear(condition_dim, 4 * hidden_dim)
+
+        # Start each residual branch close to identity.
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+    @staticmethod
+    def _modulate(features, scale, shift):
+        return features * (1 + scale.unsqueeze(-1)) + shift.unsqueeze(-1)
+
+    def forward(self, features, condition):
+        scale1, shift1, scale2, shift2 = self.film(condition).chunk(4, dim=-1)
+
+        residual = features
+        features = self._modulate(self.norm1(features), scale1, shift1)
+        features = self.conv1(F.silu(features))
+        features = self._modulate(self.norm2(features), scale2, shift2)
+        features = self.conv2(F.silu(features))
+        return residual + features
+
+
+class FiLMTemporalConvHead(nn.Module):
+    """JVP-friendly temporal action head without attention or dropout."""
+
+    def __init__(
+        self,
+        action_dim=9,
+        hidden_dim=256,
+        condition_dim=256,
+        num_blocks=6,
+        nhand=1,
+        rot_dim=6,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.output_dim = 3 + rot_dim + 1
+        self.input_projection = nn.Linear(action_dim, hidden_dim)
+        self.sequence_position_embedding = SinusoidalPosEmb(hidden_dim)
+        self.hand_embedding = nn.Embedding(nhand, hidden_dim)
+
+        self.time_embedding = SinusoidalPosEmb(hidden_dim)
+        self.time_projection = nn.Sequential(
+            nn.Linear(3 * hidden_dim, 2 * hidden_dim),
+            nn.SiLU(),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+        )
+        self.condition_projection = nn.Sequential(
+            nn.LayerNorm(condition_dim + hidden_dim),
+            nn.Linear(condition_dim + hidden_dim, condition_dim),
+            nn.SiLU(),
+            nn.Linear(condition_dim, condition_dim),
+        )
+
+        dilation_pattern = (1, 2, 4, 8)
+        self.blocks = nn.ModuleList([
+            FiLMResidualConvBlock(
+                hidden_dim=hidden_dim,
+                condition_dim=condition_dim,
+                dilation=dilation_pattern[index % len(dilation_pattern)],
+            )
+            for index in range(num_blocks)
+        ])
+        groups = min(8, hidden_dim)
+        while hidden_dim % groups != 0:
+            groups -= 1
+        self.output_norm = nn.GroupNorm(groups, hidden_dim)
+        self.output_projection = nn.Conv1d(
+            hidden_dim, self.output_dim, kernel_size=1
+        )
+
+    def _encode_condition(self, r, t, condition):
+        r = r.reshape(condition.shape[0])
+        t = t.reshape(condition.shape[0])
+        time_features = torch.cat(
+            (
+                self.time_embedding(r),
+                self.time_embedding(t),
+                self.time_embedding(t - r),
+            ),
+            dim=-1,
+        )
+        time_features = self.time_projection(time_features)
+        return self.condition_projection(
+            torch.cat((condition, time_features), dim=-1)
+        )
+
+    def forward(self, trajectory, r, t, condition):
+        batch_size, traj_len, nhand, action_dim = trajectory.shape
+        if action_dim != self.action_dim:
+            raise ValueError(
+                f"Expected trajectory dimension {self.action_dim}, "
+                f"got {action_dim}."
+            )
+        if nhand != self.hand_embedding.num_embeddings:
+            raise ValueError(
+                f"Expected {self.hand_embedding.num_embeddings} hands, "
+                f"got {nhand}."
+            )
+
+        features = self.input_projection(trajectory)
+        step_ids = torch.arange(
+            traj_len,
+            device=trajectory.device,
+            dtype=trajectory.dtype,
+        )
+        step_features = self.sequence_position_embedding(step_ids).to(
+            dtype=features.dtype
+        )
+        step_features = step_features.view(1, traj_len, 1, -1)
+        hand_ids = torch.arange(nhand, device=trajectory.device)
+        hand_features = self.hand_embedding(hand_ids).to(dtype=features.dtype)
+        hand_features = hand_features.view(1, 1, nhand, -1)
+        features = features + step_features + hand_features
+        features = einops.rearrange(
+            features, 'b l h c -> b c (l h)'
+        )
+
+        film_condition = self._encode_condition(r, t, condition)
+        for block in self.blocks:
+            features = block(features, film_condition)
+
+        output = self.output_projection(F.silu(self.output_norm(features)))
+        output = einops.rearrange(
+            output,
+            'b c (l h) -> b l h c',
+            l=traj_len,
+            h=nhand,
+        )
+        return [output]
 
 
 class TransformerHead(nn.Module):

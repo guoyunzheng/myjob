@@ -64,6 +64,9 @@ def parse_arguments():
         ('num_history', int, 1),
         # Model arguments: head
         ('num_shared_attn_layers', int, 4),
+        ('action_hidden_dim', int, 256),
+        ('action_num_blocks', int, 6),
+        ('jvp_microbatch_size', int, 8),
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_xyzw'),
         ('denoise_timesteps', int, 10),

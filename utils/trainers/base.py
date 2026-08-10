@@ -124,7 +124,10 @@ class BaseTrainTester:
             rotation_format=self.args.rotation_format,
             denoise_timesteps=self.args.denoise_timesteps,
             denoise_model=self.args.denoise_model,
-            lv2_batch_size=self.args.lv2_batch_size
+            lv2_batch_size=self.args.lv2_batch_size,
+            action_hidden_dim=self.args.action_hidden_dim,
+            action_num_blocks=self.args.action_num_blocks,
+            jvp_microbatch_size=self.args.jvp_microbatch_size,
         )
 
         # Print basic modules' parameters
@@ -336,6 +339,9 @@ class BaseTrainTester:
         )
         if self.args.pre_tokenize:
             instr = self.tokenizer(instr).cuda(non_blocking=True)
+        # The encoder keeps BF16/Flash Attention. Exact JVP avoids DDE's
+        # subtractive-cancellation issue; targets and losses cast to FP32 in
+        # the policy where numerical precision matters.
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = model(
                 action, action_mask, rgbs, rgb2d, pcds, instr, prop,

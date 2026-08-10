@@ -154,13 +154,14 @@ class MFScheduler:
         zt = (1 - texp) * x + texp * z1
         return zt.to(x.dtype)
 
-    def step(self, model_output, r,t, sample):
+    def step(self, model_output, timestep, prev_timestep, sample):
         """
         单步求解（采样阶段使用）：
 
         - 输入：
             model_output: 模型输出，期望为平均速度 u（与论文 MeanFlow 对齐）
-            timestep_ind: 当前时间索引（整数），用于从 self.timesteps 中获取 t
+            timestep: 当前时间 t
+            prev_timestep: 下一采样状态对应的较小时间 r
             sample: 当前的 z_t（即上面的 zt）
 
         - 计算：
@@ -172,12 +173,14 @@ class MFScheduler:
         注意：这里假设模型输出就是平均速度 u；若模型输出表示其他量
         （例如噪声残差 epsilon），需要在模型或调用方做对应转换。
         """
-        zt = sample
-        vc = model_output
+        if torch.any(prev_timestep > timestep):
+            raise ValueError(
+                "MeanFlow inference must run from noise to data (1 -> 0): "
+                "prev_timestep cannot be greater than timestep."
+            )
 
-
-        dt = t - r
-        pred_prev_sample = zt - dt * vc
+        dt = timestep - prev_timestep
+        pred_prev_sample = sample - dt * model_output
 
         return DummyClass(prev_sample=pred_prev_sample)
 
