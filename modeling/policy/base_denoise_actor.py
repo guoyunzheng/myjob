@@ -132,7 +132,7 @@ class DenoiseActor(nn.Module):
             r = prev_timesteps[idx]
             out_cond = self.policy_forward_pass(
                 trajectory,
-                r * torch.ones(len(trajectory), device=device),
+                t * torch.ones(len(trajectory), device=device),
                 t * torch.ones(len(trajectory), device=device),
                 fixed_inputs
             )
@@ -153,7 +153,7 @@ class DenoiseActor(nn.Module):
 
                 out_uncond = self.policy_forward_pass(
                     trajectory,
-                    r * torch.ones(len(trajectory), device=device),
+                    t * torch.ones(len(trajectory), device=device),
                     t * torch.ones(len(trajectory), device=device),
                     uncond_fixed_inputs
                 )
@@ -250,17 +250,11 @@ class DenoiseActor(nn.Module):
             #     _, dudt = jvp(u_fn, (z, r, t), (v, zeros_r, ones_t))
             #     # _, dudr = jvp(u_fn, (z_f32, r_f32, t_f32), (torch.zeros_like(z_f32), torch.ones_like(r_f32), torch.zeros_like(t_f32)))
             #尝试计算完一个再算另一个
-            # u_next_t = self.policy_forward_pass(z, r, t_next, fixed_inputs)[-1][..., :9]
-            # dudt_z=(u_next_z-u_t)/eps
-            # dudt_t = (u_next_t - u_t) / eps
 
             dudt_approx=(u_next_z-u_last)/(2*eps)
             delta = (r - t).view([t.size(0)] + [1] * (dudt_approx.dim() - 1))
             u_tgt = (v + delta * dudt_approx).detach()
 
-            # delta= (r - t).view([t.size(0)] + [1] * (dudt.dim() - 1))
-            # u_tgt = (v + delta * dudt).detach()
-            
             pred_ivc_list = self.policy_forward_pass(noisy_trajectory, t, t, fixed_inputs)#换成t试一下
             u_ivc_pred = pred_ivc_list[-1][..., :9]
             loss_ivc =F.mse_loss(u_ivc_pred, v) 
