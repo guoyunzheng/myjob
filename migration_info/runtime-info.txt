@@ -1,0 +1,7 @@
+Platform: Linux-5.15.0-139-generic-x86_64-with-glibc2.31
+Python: 3.10.19 (main, Oct 21 2025, 16:43:05) [GCC 11.2.0]
+Python executable: /home/adminpc/anaconda3/envs/3dfa/bin/python
+PyTorch: 2.9.0+cu128
+PyTorch CUDA: 12.8
+cuDNN: 91002
+CUDA available: True
