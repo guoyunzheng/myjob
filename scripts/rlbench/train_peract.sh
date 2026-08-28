@@ -24,7 +24,7 @@ backbone_lr=1e-6  # doesn't matter when we don't finetune
 lr_scheduler=constant
 wd=1e-10
 train_iters=300000
-use_compile=false # much faster, but sometimes unstable
+use_compile=true # much faster, but sometimes unstable
 use_ema=false
 lv2_batch_size=1  # you can increase this and divide B equally, speed/accuracy tradeoff
 

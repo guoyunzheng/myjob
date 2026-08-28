@@ -223,7 +223,7 @@ class DenoiseActor(nn.Module):
             t, r = self.position_scheduler.sample_noise_step(
                 num_noise=len(noise), device=noise.device
             )
-            eps = 1e-4
+            eps = 0.005
             
 
             pos = self.position_scheduler.add_noise(gt_trajectory[..., :3], noise[..., :3], t)

@@ -35,6 +35,8 @@ keypose_only=true
 pre_tokenize=true
 workspace_normalizer_buffer=0.04
 
+# jvp_microbatch_size=16
+
 backbone=clip
 finetune_backbone=false
 finetune_text_encoder=false
@@ -54,10 +56,10 @@ denoise_model=meanflow
 run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model
 checkpoint=train_logs/${main_dir}/${run_log_dir}/last.pth
 
-# 开启可扩展段以减少显存碎片
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# 限制显存预占
-export PYTORCH_ALLOC_CONF=max_split_size_mb:128
+# # 开启可扩展段以减少显存碎片
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# # 限制显存预占
+# export PYTORCH_ALLOC_CONF=max_split_size_mb:128
 ngpus=1  # we used 4
 
 torchrun --nproc_per_node $ngpus --master_port $RANDOM \
@@ -103,3 +105,4 @@ torchrun --nproc_per_node $ngpus --master_port $RANDOM \
     --rotation_format $rotation_format \
     --denoise_timesteps $denoise_timesteps \
     --denoise_model $denoise_model
+    # --jvp_microbatch_size $jvp_microbatch_size \
