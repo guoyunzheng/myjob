@@ -48,7 +48,13 @@ num_history=3
 num_shared_attn_layers=4
 action_hidden_dim=256
 action_num_blocks=6
-jvp_microbatch_size=8
+# Exact JVP is always used by MeanFlow. This switch only controls whether its
+# stop-gradient target is computed in smaller chunks to reduce peak VRAM.
+jvp_chunking=${JVP_CHUNKING:-true}
+jvp_microbatch_size=${JVP_MICROBATCH_SIZE:-8}
+if [ "$jvp_chunking" = "false" ] || [ "$jvp_chunking" = "False" ] || [ "$jvp_chunking" = "0" ]; then
+    jvp_microbatch_size=0  # <= 0 means one full-batch exact JVP call
+fi
 guidance_scale=1.0
 endpoint_loss_weight=0.25
 ivc_loss_weight=0.0
