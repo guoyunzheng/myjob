@@ -18,8 +18,9 @@ from ..common_utils import count_parameters
 from ..depth2cloud import fetch_depth2cloud
 from ..data_preprocessors import fetch_data_preprocessor
 from ..ema import EMA
+from ..checkpoint_utils import load_model_state_strict
 from ..schedulers import fetch_scheduler
-from .utils import compute_metrics
+from .utils import compute_metrics, compute_task_balanced_selection
 
 
 class BaseTrainTester:
@@ -49,7 +50,8 @@ class BaseTrainTester:
             instructions=self.args.train_instructions,
             relative_action=self.args.relative_action,
             mem_limit=self.args.memory_limit,
-            chunk_size=self.args.chunk_size
+            chunk_size=self.args.chunk_size,
+            deterministic_instructions=False,
         )
         val_dataset = self.dataset_cls(
             root=self.args.eval_data_dir,
@@ -57,7 +59,8 @@ class BaseTrainTester:
             copies=1,
             relative_action=self.args.relative_action,
             mem_limit=0.1,
-            chunk_size=self.args.chunk_size
+            chunk_size=self.args.chunk_size,
+            deterministic_instructions=True,
         )
         return train_dataset, val_dataset
 
@@ -109,7 +112,7 @@ class BaseTrainTester:
     def get_model(self):
         """Initialize the model."""
         # Initialize model with arguments
-        _model = self.model_cls(
+        model_kwargs = dict(
             backbone=self.args.backbone,
             finetune_backbone=self.args.finetune_backbone,
             finetune_text_encoder=self.args.finetune_text_encoder,
@@ -125,10 +128,19 @@ class BaseTrainTester:
             denoise_timesteps=self.args.denoise_timesteps,
             denoise_model=self.args.denoise_model,
             lv2_batch_size=self.args.lv2_batch_size,
-            action_hidden_dim=self.args.action_hidden_dim,
-            action_num_blocks=self.args.action_num_blocks,
-            jvp_microbatch_size=self.args.jvp_microbatch_size,
         )
+        if self.args.model_type == "denoise3d":
+            model_kwargs.update(
+                action_hidden_dim=self.args.action_hidden_dim,
+                action_num_blocks=self.args.action_num_blocks,
+                jvp_microbatch_size=self.args.jvp_microbatch_size,
+                guidance_scale=self.args.guidance_scale,
+                endpoint_loss_weight=self.args.endpoint_loss_weight,
+                ivc_loss_weight=self.args.ivc_loss_weight,
+                condition_dropout_prob=self.args.condition_dropout_prob,
+                gripper_transition_weight=self.args.gripper_transition_weight,
+            )
+        _model = self.model_cls(**model_kwargs)
 
         # Print basic modules' parameters
         if dist.get_rank() == 0:
@@ -339,9 +351,9 @@ class BaseTrainTester:
         )
         if self.args.pre_tokenize:
             instr = self.tokenizer(instr).cuda(non_blocking=True)
-        # The encoder keeps BF16/Flash Attention. Exact JVP avoids DDE's
-        # subtractive-cancellation issue; targets and losses cast to FP32 in
-        # the policy where numerical precision matters.
+        # The encoder keeps BF16/Flash Attention. The compact action head and
+        # exact JVP switch back to FP32 inside the policy where millimeter-scale
+        # numerical precision matters.
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = model(
                 action, action_mask, rgbs, rgb2d, pcds, instr, prop,
@@ -377,40 +389,45 @@ class BaseTrainTester:
         device = next(model.parameters()).device
         model.eval()
 
-        for i, sample in tqdm(enumerate(loader)):
-            if i == val_iters:
-                break
+        cuda_devices = [device.index] if device.type == "cuda" else []
+        # Compare checkpoints with the same validation noise without perturbing
+        # the RNG stream used by subsequent training batches.
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(0)
+            for i, sample in tqdm(enumerate(loader)):
+                if i == val_iters:
+                    break
 
-            pred_action = self._model_forward(model, sample, training=False)
-            gt_action = sample["action"].cuda(non_blocking=True)
-            if self.args.relative_action:
-                pred_action = relative_to_absolute(
-                    pred_action[:, :, 0],
-                    sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
-                )
-                gt_action = relative_to_absolute(
-                    gt_action[:, :, 0],
-                    sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
-                )
+                pred_action = self._model_forward(model, sample, training=False)
+                gt_action = sample["action"].cuda(non_blocking=True)
+                if self.args.relative_action:
+                    pred_action = relative_to_absolute(
+                        pred_action[:, :, 0],
+                        sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
+                    )
+                    gt_action = relative_to_absolute(
+                        gt_action[:, :, 0],
+                        sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
+                    )
 
-            losses, losses_B = compute_metrics(pred_action, gt_action)
+                losses, losses_B = compute_metrics(pred_action, gt_action)
 
-            # Gather global statistics
-            for n, l in losses.items():
-                key = f"{split}-losses/mean/{n}"
-                if key not in values:
-                    values[key] = torch.Tensor([]).to(device)
-                values[key] = torch.cat([values[key], l.unsqueeze(0)])
-
-            # Gather per-task statistics
-            tasks = np.array(sample["task"])
-            for n, l in losses_B.items():
-                for task in np.unique(tasks):
-                    key = f"{split}-loss/{task}/{n}"
-                    l_task = l[tasks == task].mean()
+                # Gather global statistics
+                for n, l in losses.items():
+                    key = f"{split}-losses/mean/{n}"
                     if key not in values:
                         values[key] = torch.Tensor([]).to(device)
-                    values[key] = torch.cat([values[key], l_task.unsqueeze(0)])
+                    values[key] = torch.cat([values[key], l.unsqueeze(0)])
+
+                # Gather per-task statistics
+                tasks = np.array(sample["task"])
+                for n, l in losses_B.items():
+                    for task in np.unique(tasks):
+                        key = f"{split}-loss/{task}/{n}"
+                        l_task = l[tasks == task].mean()
+                        if key not in values:
+                            values[key] = torch.Tensor([]).to(device)
+                        values[key] = torch.cat([values[key], l_task.unsqueeze(0)])
 
         # Log all statistics
         values = {k: v.mean().item() for k, v in values.items()}
@@ -424,7 +441,50 @@ class BaseTrainTester:
             for key, value in values.items():
                 print(f"{key}: {value:.03f}")
 
-        return -values[f'{split}-losses/mean/traj_pos_acc_001']
+        # Select checkpoints by a task-balanced metric. A global sample mean is
+        # easily dominated by coarse, high-success tasks and can improve while
+        # insertion/stacking tasks remain unusable.
+        task_scores = [
+            value for key, value in values.items()
+            if key.startswith(f'{split}-loss/')
+            and key.endswith('/traj_score')
+        ]
+        if not task_scores:
+            raise RuntimeError(
+                f"No per-task trajectory scores were produced for {split}."
+            )
+        (
+            macro_score,
+            worst_quartile_score,
+            selection_score,
+        ) = compute_task_balanced_selection(
+            task_scores,
+            worst_fraction=0.25,
+        )
+        if dist.get_rank() == 0:
+            print(
+                "Checkpoint selection: "
+                f"macro={macro_score:.4f}, "
+                f"worst_quartile={worst_quartile_score:.4f}, "
+                f"combined={selection_score:.4f}"
+            )
+            if step_id > -1:
+                self.writer.add_scalar(
+                    f'{split}-losses/selection/macro_score',
+                    macro_score,
+                    step_id,
+                )
+                self.writer.add_scalar(
+                    f'{split}-losses/selection/worst_quartile_score',
+                    worst_quartile_score,
+                    step_id,
+                )
+                self.writer.add_scalar(
+                    f'{split}-losses/selection/combined_score',
+                    selection_score,
+                    step_id,
+                )
+        return selection_score
 
     def load_checkpoint(self, model, ema_model, optimizer):
         """Load from checkpoint."""
@@ -439,19 +499,26 @@ class BaseTrainTester:
             map_location="cpu",
             weights_only=True
         )
-        # Load weights flexibly
-        msn, unxpct = model.load_state_dict(model_dict["weight"], strict=False)
-        if msn:
-            print(f"Missing keys (not found in checkpoint): {len(msn)}")
-            print(msn)
-        if unxpct:
-            print(f"Unexpected keys (ignored): {len(unxpct)}")
-            print(unxpct)
-        if not msn and not unxpct:
-            print("All keys matched successfully!")
+        precision_upgrade_prefixes = (
+            "encoder.proprio_state_encoder.",
+            "condition_pooler.relevance_score.",
+            "condition_pooler.spatial_moment_projection.",
+        )
+        load_model_state_strict(
+            model,
+            model_dict,
+            self.args.checkpoint,
+            allowed_missing_prefixes=precision_upgrade_prefixes,
+        )
+        print("All model keys matched successfully.")
         # EMA weights
         if model_dict.get("ema_weight") is not None:
-            ema_model.load_state_dict(model_dict["ema_weight"], strict=True)
+            load_model_state_strict(
+                ema_model,
+                model_dict["ema_weight"],
+                f"{self.args.checkpoint} (EMA)",
+                allowed_missing_prefixes=precision_upgrade_prefixes,
+            )
         # Useful for resuming training
         if 'optimizer' in model_dict and not self.args.eval_only:
             optimizer.load_state_dict(model_dict["optimizer"])
@@ -470,6 +537,11 @@ class BaseTrainTester:
         """Save checkpoint if requested."""
         model_state = model.state_dict()
         ema_state = ema_model.state_dict() if self.args.use_ema else None
+        config = {
+            key: str(value) if hasattr(value, "__fspath__") else value
+            for key, value in vars(self.args).items()
+            if key not in {"local_rank", "log_dir"}
+        }
 
         # Best checkpoint
         if best_loss is None or new_loss <= best_loss:
@@ -478,7 +550,8 @@ class BaseTrainTester:
                 "weight": model_state,
                 "ema_weight": ema_state,
                 "iter": step_id + 1,
-                "best_loss": best_loss
+                "best_loss": best_loss,
+                "config": config,
             }, self.args.log_dir / "best.pth")
 
         # Last checkpoint (always saved)
@@ -487,7 +560,8 @@ class BaseTrainTester:
             "ema_weight": ema_state,
             "optimizer": optimizer.state_dict(),
             "iter": step_id + 1,
-            "best_loss": best_loss
+            "best_loss": best_loss,
+            "config": config,
         }, self.args.log_dir / "last.pth")
 
         # Save intermediate checkpoints
@@ -496,7 +570,8 @@ class BaseTrainTester:
                 "weight": model_state,
                 "ema_weight": ema_state,
                 "iter": step_id + 1,
-                "best_loss": best_loss
+                "best_loss": best_loss,
+                "config": config,
             }, self.args.log_dir / f"interm{step_id + 1}.pth")
 
         return best_loss

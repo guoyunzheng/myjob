@@ -88,6 +88,21 @@ class Encoder(nn.Module):
             fps_scene_feats, fps_scene_pos
         )
 
+    def instruction_padding_mask(self, tokens):
+        """Mask repeated CLIP EOS tokens used as right padding.
+
+        The first EOS token is meaningful; identical EOS tokens after it are
+        padding and must not dilute visual-language attention or pooling.
+        """
+        if not torch.is_tensor(tokens) or tokens.ndim != 2:
+            return None
+        config = getattr(getattr(self.text_encoder, "model", None), "config", None)
+        eos_token_id = getattr(config, "eos_token_id", None)
+        if eos_token_id is None:
+            return None
+        eos_count = tokens.eq(eos_token_id).cumsum(dim=-1)
+        return eos_count > 1
+
     def encode_proprio(self, proprio, context_feats, context_pos):
         """
         Compute proprioception features.

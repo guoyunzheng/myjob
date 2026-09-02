@@ -22,13 +22,18 @@ class DenoiseActor(BaseDenoiseActor):
                  relative=False,
                  rotation_format='quat_xyzw',
                  # Denoising arguments
-                 denoise_timesteps=100,
-                 denoise_model="ddpm",
+                 denoise_timesteps=2,
+                 denoise_model="meanflow",
                  # Training arguments
                  lv2_batch_size=1,
                  action_hidden_dim=256,
                  action_num_blocks=6,
-                 jvp_microbatch_size=8):
+                 jvp_microbatch_size=8,
+                 guidance_scale=1.0,
+                 endpoint_loss_weight=0.25,
+                 ivc_loss_weight=0.0,
+                 condition_dropout_prob=0.0,
+                 gripper_transition_weight=2.0):
         super().__init__(
             embedding_dim=embedding_dim,
             num_attn_heads=num_attn_heads,
@@ -43,6 +48,11 @@ class DenoiseActor(BaseDenoiseActor):
             action_hidden_dim=action_hidden_dim,
             action_num_blocks=action_num_blocks,
             jvp_microbatch_size=jvp_microbatch_size,
+            guidance_scale=guidance_scale,
+            endpoint_loss_weight=endpoint_loss_weight,
+            ivc_loss_weight=ivc_loss_weight,
+            condition_dropout_prob=condition_dropout_prob,
+            gripper_transition_weight=gripper_transition_weight,
         )
 
         # Vision-language encoder, runs only once

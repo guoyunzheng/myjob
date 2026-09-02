@@ -12,6 +12,7 @@ import numpy as np
 from datasets import fetch_dataset_class
 from modeling.policy import fetch_model_class
 from utils.common_utils import str2bool, str_none, round_floats
+from utils.checkpoint_utils import load_model_state_strict
 
 
 def parse_arguments():
@@ -48,10 +49,11 @@ def parse_arguments():
         ('num_shared_attn_layers', int, 4),
         ('action_hidden_dim', int, 256),
         ('action_num_blocks', int, 6),
+        ('guidance_scale', float, 1.0),
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_xyzw'),
-        ('denoise_timesteps', int, 10),
-        ('denoise_model', str, "rectified_flow")
+        ('denoise_timesteps', int, 2),
+        ('denoise_model', str, "meanflow")
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
@@ -63,7 +65,7 @@ def load_models(args):
     print("Loading model from", args.checkpoint, flush=True)
 
     model_class = fetch_model_class(args.model_type)
-    model = model_class(
+    model_kwargs = dict(
         backbone=args.backbone,
         num_vis_instr_attn_layers=args.num_vis_instr_attn_layers,
         fps_subsampling_factor=args.fps_subsampling_factor,
@@ -72,23 +74,68 @@ def load_models(args):
         nhist=args.num_history,
         nhand=2 if args.bimanual else 1,
         num_shared_attn_layers=args.num_shared_attn_layers,
-        action_hidden_dim=args.action_hidden_dim,
-        action_num_blocks=args.action_num_blocks,
         relative=args.relative_action,
         rotation_format=args.rotation_format,
         denoise_timesteps=args.denoise_timesteps,
         denoise_model=args.denoise_model
     )
+    if args.model_type == "denoise3d":
+        model_kwargs.update(
+            action_hidden_dim=args.action_hidden_dim,
+            action_num_blocks=args.action_num_blocks,
+            guidance_scale=args.guidance_scale,
+        )
+    model = model_class(**model_kwargs)
 
     # Load model weights
     model_dict = torch.load(
         args.checkpoint, map_location="cpu", weights_only=True
     )
-    model_dict_weight = {}
-    for key in model_dict["weight"]:
-        _key = key[7:]
-        model_dict_weight[_key] = model_dict["weight"][key]
-    model.load_state_dict(model_dict_weight, strict=False)
+    checkpoint_config = model_dict.get("config")
+    if checkpoint_config:
+        if checkpoint_config.get("denoise_model") != args.denoise_model:
+            raise ValueError(
+                "Checkpoint denoise_model mismatch: trained with "
+                f"{checkpoint_config.get('denoise_model')!r}, requested "
+                f"{args.denoise_model!r}."
+            )
+        trained_steps = checkpoint_config.get("denoise_timesteps")
+        if trained_steps is not None and trained_steps != args.denoise_timesteps:
+            print(
+                "WARNING: inference step count differs from checkpoint validation: "
+                f"trained/validated={trained_steps}, requested={args.denoise_timesteps}."
+            )
+        trained_guidance = checkpoint_config.get("guidance_scale")
+        if (
+            trained_guidance is not None
+            and float(trained_guidance) != args.guidance_scale
+        ):
+            print(
+                "WARNING: inference guidance differs from checkpoint recipe: "
+                f"trained/validated={trained_guidance}, "
+                f"requested={args.guidance_scale}."
+            )
+
+    selected_weight = (
+        model_dict["ema_weight"]
+        if model_dict.get("ema_weight") is not None
+        else model_dict["weight"]
+    )
+    weight_name = "EMA" if model_dict.get("ema_weight") is not None else "raw"
+    load_model_state_strict(
+        model,
+        selected_weight,
+        str(args.checkpoint),
+        allowed_missing_prefixes=(
+            "encoder.proprio_state_encoder.",
+            "condition_pooler.relevance_score.",
+            "condition_pooler.spatial_moment_projection.",
+        ),
+    )
+    print(
+        f"Loaded {weight_name} weights strictly "
+        f"(training step {model_dict.get('iter', 'unknown')})."
+    )
     model.eval()
 
     return model.cuda()

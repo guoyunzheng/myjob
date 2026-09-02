@@ -49,9 +49,12 @@ num_vis_instr_attn_layers=2
 num_history=3
 
 num_shared_attn_layers=4
+action_hidden_dim=256
+action_num_blocks=6
+guidance_scale=1.0
 relative_action=false
 rotation_format=quat_xyzw
-denoise_timesteps=5
+denoise_timesteps=2
 denoise_model=meanflow
 
 num_ckpts=${#tasks[@]}
@@ -78,6 +81,9 @@ for ((i=0; i<$num_ckpts; i++)); do
         --num_vis_instr_attn_layers $num_vis_instr_attn_layers \
         --num_history $num_history \
         --num_shared_attn_layers $num_shared_attn_layers \
+        --action_hidden_dim $action_hidden_dim \
+        --action_num_blocks $action_num_blocks \
+        --guidance_scale $guidance_scale \
         --relative_action $relative_action \
         --rotation_format $rotation_format \
         --denoise_timesteps $denoise_timesteps \

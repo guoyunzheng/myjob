@@ -67,10 +67,15 @@ def parse_arguments():
         ('action_hidden_dim', int, 256),
         ('action_num_blocks', int, 6),
         ('jvp_microbatch_size', int, 8),
+        ('guidance_scale', float, 1.0),
+        ('endpoint_loss_weight', float, 0.25),
+        ('ivc_loss_weight', float, 0.0),
+        ('condition_dropout_prob', float, 0.0),
+        ('gripper_transition_weight', float, 2.0),
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_xyzw'),
-        ('denoise_timesteps', int, 10),
-        ('denoise_model', str, "rectified_flow")
+        ('denoise_timesteps', int, 2),
+        ('denoise_model', str, "meanflow")
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])

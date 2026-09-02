@@ -14,17 +14,39 @@ class PeractDataPreprocessor(DataPreprocessor):
             custom_imsize=custom_imsize,
             depth2cloud=depth2cloud
         )
-        self.aug = K.AugmentationSequential(
+        # RGB and XYZ must share exactly the same sampled image transform, but
+        # they must not share an interpolation rule. Bilinear interpolation is
+        # appropriate for color; on a point cloud it invents 3D points between
+        # foreground and background surfaces.
+        self.rgb_aug = K.AugmentationSequential(
             K.RandomAffine(
                 degrees=0,
                 translate=0.0,
-                scale=(0.75, 1.25),
+                scale=(0.90, 1.10),
+                resample="bilinear",
                 padding_mode="reflection",
-                p=0.8
+                p=0.5
             ),
             K.RandomResizedCrop(
                 size=(orig_imsize, orig_imsize),
-                scale=(0.95, 1.05),
+                scale=(0.95, 1.0),
+                resample="bilinear",
+                p=0.1
+            )
+        ).cuda()
+        self.pcd_aug = K.AugmentationSequential(
+            K.RandomAffine(
+                degrees=0,
+                translate=0.0,
+                scale=(0.90, 1.10),
+                resample="nearest",
+                padding_mode="reflection",
+                p=0.5
+            ),
+            K.RandomResizedCrop(
+                size=(orig_imsize, orig_imsize),
+                scale=(0.95, 1.0),
+                resample="nearest",
                 p=0.1
             )
         ).cuda()
@@ -38,16 +60,23 @@ class PeractDataPreprocessor(DataPreprocessor):
         # Handle non-wrist cameras, which may require augmentations
         if augment:
             b, nc, _, h, w = rgbs.shape
-            # Augment in half precision
-            obs = torch.cat((
-                rgbs.cuda(non_blocking=True).half() / 255,
-                pcds.cuda(non_blocking=True).half()
-            ), 2)  # (B, ncam, 6, H, W)
-            obs = obs.reshape(-1, 6, h, w)
-            obs = self.aug(obs)
-            # Convert to full precision
-            rgb_3d = obs[:, :3].reshape(b, nc, 3, h, w).float()
-            pcd_3d = obs[:, 3:].reshape(b, nc, 3, h, w).float()
+            rgb_flat = (
+                rgbs.cuda(non_blocking=True).float() / 255
+            ).reshape(-1, 3, h, w)
+            pcd_flat = pcds.cuda(non_blocking=True).float().reshape(
+                -1, 3, h, w
+            )
+
+            rgb_3d = self.rgb_aug(rgb_flat)
+            # AugmentationSequential exposes the sampled parameter list so the
+            # geometrically identical transform can be replayed with nearest
+            # interpolation on XYZ.
+            pcd_3d = self.pcd_aug(
+                pcd_flat,
+                params=self.rgb_aug._params,
+            )
+            rgb_3d = rgb_3d.reshape(b, nc, 3, h, w)
+            pcd_3d = pcd_3d.reshape(b, nc, 3, h, w)
         else:
             # Simply convert to full precision
             rgb_3d = rgbs.cuda(non_blocking=True).float() / 255

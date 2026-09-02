@@ -39,6 +39,20 @@ class Mover:
         self._task = task
         self._last_action = None
         self._max_tries = max_tries
+        self.last_position_error = float("nan")
+        self.last_rotation_error_deg = float("nan")
+        self.last_attempts = 0
+
+    @staticmethod
+    def _rotation_error_deg(target_quat, actual_quat):
+        target_quat = target_quat / np.clip(
+            np.linalg.norm(target_quat), 1e-8, None
+        )
+        actual_quat = actual_quat / np.clip(
+            np.linalg.norm(actual_quat), 1e-8, None
+        )
+        cosine = np.clip(np.abs(np.dot(target_quat, actual_quat)), 0.0, 1.0)
+        return float(np.degrees(2.0 * np.arccos(cosine)))
 
     def __call__(self, action, collision_checking=False):
         # action is an array (8,)
@@ -50,7 +64,7 @@ class Mover:
         target = action.copy()
         if self._last_action is not None:
             action[7] = self._last_action[7].copy()
-        for _ in range(self._max_tries):
+        for attempt in range(1, self._max_tries + 1):
             action_collision = np.ones(action.shape[0]+1)
             action_collision[:-1] = action
             if collision_checking:
@@ -60,7 +74,13 @@ class Mover:
             # Check if we reached the desired pose (planner may be inaccurate)
             pos = obs.gripper_pose[:3]
             dist_pos = np.sqrt(np.square(target[:3] - pos).sum())
-            criteria = (dist_pos < 5e-3,)
+            dist_rot = self._rotation_error_deg(
+                target[3:7], obs.gripper_pose[3:7]
+            )
+            self.last_position_error = float(dist_pos)
+            self.last_rotation_error_deg = dist_rot
+            self.last_attempts = attempt
+            criteria = (dist_pos < 5e-3, dist_rot < 5.0)
 
             if all(criteria) or reward == 1:
                 break
@@ -114,7 +134,7 @@ class Actioner:
             None,
             pcds,
             self._instr,
-            gripper[:, :, None, :7],
+            gripper[:, :, None, :],
             run_inference=True
         ).view(1, prediction_len, 8)
 
@@ -140,6 +160,7 @@ class RLBenchEnv:
         self.apply_depth = apply_depth
         self.apply_pc = apply_pc
         self.apply_cameras = apply_cameras
+        self.collision_checking = collision_checking
 
         # setup RLBench environments
         self.obs_config = self.create_obs_config(
@@ -227,6 +248,7 @@ class RLBenchEnv:
         ]
 
         var_success_rates = {}
+        var_success_counts = {}
         var_num_valid_demos = {}
 
         for variation in tqdm(task_variations):
@@ -244,13 +266,14 @@ class RLBenchEnv:
                 )
             )
             if valid:
-                var_success_rates[variation] = success_rate
+                var_success_counts[variation] = success_rate
                 var_num_valid_demos[variation] = num_valid_demos
+                var_success_rates[variation] = success_rate / num_valid_demos
 
         self.env.shutdown()
 
         var_success_rates["mean"] = (
-            sum(var_success_rates.values()) /
+            sum(var_success_counts.values()) /
             sum(var_num_valid_demos.values())
         )
 
@@ -287,6 +310,10 @@ class RLBenchEnv:
 
             move = Mover(task, max_tries=max_tries)
             max_reward = 0.0
+            execution_position_errors = []
+            execution_rotation_errors = []
+            execution_attempts = []
+            num_action_errors = 0
 
             for step_id in range(max_steps):
 
@@ -319,7 +346,13 @@ class RLBenchEnv:
 
                     # execute
                     for action in actions:
-                        obs, reward, _ = move(action, collision_checking=False)
+                        obs, reward, _ = move(
+                            action,
+                            collision_checking=self.collision_checking,
+                        )
+                        execution_position_errors.append(move.last_position_error)
+                        execution_rotation_errors.append(move.last_rotation_error_deg)
+                        execution_attempts.append(move.last_attempts)
 
                     max_reward = max(max_reward, reward)
 
@@ -329,6 +362,7 @@ class RLBenchEnv:
 
                 except (IKError, ConfigurationPathError, InvalidActionError) as e:
                     print(task_str, demo, step_id, success_rate, e)
+                    num_action_errors += 1
                     reward = 0
 
             total_reward += max_reward
@@ -346,6 +380,19 @@ class RLBenchEnv:
                 f"SR: {success_rate}/{demo_id + 1}",
                 f"SR: {total_reward:.2f}/{demo_id + 1}",
                 "# valid demos", demo_id + 1,
+                "PolicySteps", step_id + 1,
+                "ActionErrors", num_action_errors,
+                "PlanErr(mm/deg)",
+                (
+                    f"{1e3 * np.mean(execution_position_errors):.1f}/"
+                    f"{np.mean(execution_rotation_errors):.1f}"
+                    if execution_position_errors else "n/a"
+                ),
+                "PlanAttempts",
+                (
+                    f"{np.mean(execution_attempts):.2f}"
+                    if execution_attempts else "n/a"
+                ),
             )
 
         # Compensate for failed demos

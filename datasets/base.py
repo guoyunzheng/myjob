@@ -16,13 +16,15 @@ class BaseDataset(Dataset):
         relative_action=False,  # whether to return relative actions
         mem_limit=8,  # cache limit per dataset class in GigaBytes
         actions_only=False,  # return actions without observations
-        chunk_size=4  # chunk size for zarr
+        chunk_size=4,  # chunk size for zarr
+        deterministic_instructions=False,
     ):
         super().__init__()
         self.copies = self.train_copies if copies is None else copies
         self._relative_action = relative_action
         self._actions_only = actions_only
         self.chunk_size = chunk_size
+        self._deterministic_instructions = deterministic_instructions
 
         # Load instructions
         self._instructions = self._load_instructions(instructions)

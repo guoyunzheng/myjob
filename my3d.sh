@@ -52,7 +52,6 @@ tasks=(
     put_groceries_in_cupboard
     put_item_in_drawer
     put_money_in_safe
-    reach_and_drag
     slide_block_to_color_target
     stack_blocks
     stack_cups
@@ -62,13 +61,12 @@ tasks=(
 )
 
 # Testing arguments
-checkpoint=best.pth
-checkpoint_alias=my_awesome_peract_model
+checkpoint=${CHECKPOINT:-best.pth}
 
-max_tries=2
-max_steps=20
+max_tries=${MAX_TRIES:-2}
+max_steps=${MAX_STEPS:-20}
 headless=False
-collision_checking=False #可能的问题。
+collision_checking=${COLLISION_CHECKING:-False}
 seed=0
 
 # Dataset arguments
@@ -90,10 +88,14 @@ num_vis_instr_attn_layers=2
 num_history=3
 
 num_shared_attn_layers=4
+action_hidden_dim=256
+action_num_blocks=6
+guidance_scale=${GUIDANCE_SCALE:-1.0}
 relative_action=false
 rotation_format=quat_xyzw
-denoise_timesteps=2
+denoise_timesteps=${DENOISE_TIMESTEPS:-2}
 denoise_model=meanflow
+checkpoint_alias=${CHECKPOINT_ALIAS:-my_awesome_peract_model-s${denoise_timesteps}-g${guidance_scale}}
 
 num_ckpts=${#tasks[@]}
 for ((i=0; i<$num_ckpts; i++)); do
@@ -119,6 +121,9 @@ for ((i=0; i<$num_ckpts; i++)); do
         --num_vis_instr_attn_layers $num_vis_instr_attn_layers \
         --num_history $num_history \
         --num_shared_attn_layers $num_shared_attn_layers \
+        --action_hidden_dim $action_hidden_dim \
+        --action_num_blocks $action_num_blocks \
+        --guidance_scale $guidance_scale \
         --relative_action $relative_action \
         --rotation_format $rotation_format \
         --denoise_timesteps $denoise_timesteps \
@@ -127,6 +132,3 @@ done
 
 python online_evaluation_rlbench/collect_results.py \
     --folder eval_logs/$exp/$checkpoint_alias/seed$seed/
-
-
-

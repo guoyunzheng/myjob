@@ -42,7 +42,8 @@ class RLBenchDataset(BaseDataset):
         relative_action=False,
         mem_limit=8,
         actions_only=False,
-        chunk_size=4
+        chunk_size=4,
+        deterministic_instructions=False,
     ):
         super().__init__(
             root=root,
@@ -51,7 +52,8 @@ class RLBenchDataset(BaseDataset):
             relative_action=relative_action,
             mem_limit=mem_limit,
             actions_only=actions_only,
-            chunk_size=chunk_size
+            chunk_size=chunk_size,
+            deterministic_instructions=deterministic_instructions,
         )
 
     def _get_task(self, idx):
@@ -61,13 +63,18 @@ class RLBenchDataset(BaseDataset):
         ]
 
     def _get_instr(self, idx):
-        return [
-            random.choice(self._instructions[self.tasks[int(t)]][str(int(v))])
-            for t, v in zip(
-                self.annos['task_id'][idx:idx + self.chunk_size],
-                self.annos['variation'][idx:idx + self.chunk_size]
+        instructions = []
+        for t, v in zip(
+            self.annos['task_id'][idx:idx + self.chunk_size],
+            self.annos['variation'][idx:idx + self.chunk_size]
+        ):
+            choices = self._instructions[self.tasks[int(t)]][str(int(v))]
+            instructions.append(
+                choices[0]
+                if self._deterministic_instructions
+                else random.choice(choices)
             )
-        ]
+        return instructions
 
     def _get_rgb2d(self, idx):
         if self.camera_inds2d is not None:

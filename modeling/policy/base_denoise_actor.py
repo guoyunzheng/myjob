@@ -26,23 +26,39 @@ class DenoiseActor(nn.Module):
                  relative=False,
                  rotation_format='quat_xyzw',
                  # Denoising arguments
-                 denoise_timesteps=5,
+                 denoise_timesteps=2,
                  denoise_model="meanflow",  
                  # Training arguments
                  lv2_batch_size=4,
                  action_hidden_dim=256,
                  action_num_blocks=6,
-                 jvp_microbatch_size=8):
+                 jvp_microbatch_size=8,
+                 guidance_scale=1.0,
+                 endpoint_loss_weight=0.25,
+                 ivc_loss_weight=0.0,
+                 condition_dropout_prob=0.0,
+                 gripper_transition_weight=2.0):
         super().__init__()
+        if not 0.0 <= condition_dropout_prob <= 1.0:
+            raise ValueError("condition_dropout_prob must be in [0, 1].")
+        if gripper_transition_weight < 0.0:
+            raise ValueError("gripper_transition_weight must be non-negative.")
         # Arguments to be accessed by the main class
         self._rotation_format = rotation_format
         self._relative = relative
         self._lv2_batch_size = lv2_batch_size
         self._jvp_microbatch_size = jvp_microbatch_size
+        self._guidance_scale = guidance_scale
+        self._endpoint_loss_weight = endpoint_loss_weight
+        self._ivc_loss_weight = ivc_loss_weight
+        self._gripper_transition_weight = gripper_transition_weight
 
         # Vision-language encoder, runs only once
         self.encoder = None  # Implement this!
-        self.cond_mask_prob = 0.1
+        # The encoded visual tokens are already language-conditioned, so
+        # clearing only the pooled language tokens does not form a valid CFG
+        # unconditional branch. Keep it off when inference uses scale 1.
+        self.cond_mask_prob = condition_dropout_prob
         # The observation encoder may keep using attention/Flash Attention.
         # Only this compact, deterministic action decoder is traversed by JVP.
         action_dim = 6 if rotation_format == 'euler' else 9
@@ -113,14 +129,22 @@ class DenoiseActor(nn.Module):
         # Accept the old fixed-input tuple as a convenience for external callers.
         if not torch.is_tensor(condition):
             condition = self.encode_condition(condition)
-        return self.prediction_head(
-            trajectory,
-            timestep1,
-            timestep2,
-            condition,
-        )
+        # The Transformer/Flash encoder remains under BF16 autocast, but the
+        # compact FiLM-TCN directly emits normalized metric actions. Keeping
+        # this small head in FP32 prevents millimeter-scale corrections from
+        # being quantized before either the loss or the MeanFlow integration.
+        with torch.autocast(
+            device_type=trajectory.device.type,
+            enabled=False,
+        ):
+            return self.prediction_head(
+                trajectory.float(),
+                timestep1.float(),
+                timestep2.float(),
+                condition.float(),
+            )
 
-    def conditional_sample(self, trajectory, device, fixed_inputs, guidance_scale=2.0, uncond_inputs=None):
+    def conditional_sample(self, trajectory, device, fixed_inputs, guidance_scale=1.0, uncond_inputs=None):
         self.position_scheduler.set_timesteps(self.n_steps, device=device)
         self.rotation_scheduler.set_timesteps(self.n_steps, device=device)
 
@@ -134,8 +158,6 @@ class DenoiseActor(nn.Module):
                 uncond_fixed_inputs = list(fixed_inputs)
                 if len(uncond_fixed_inputs) > 5 and uncond_fixed_inputs[5] is not None:
                     uncond_fixed_inputs[5] = torch.zeros_like(uncond_fixed_inputs[5])
-                if len(uncond_fixed_inputs) > 6 and uncond_fixed_inputs[6] is not None:
-                    uncond_fixed_inputs[6] = torch.zeros_like(uncond_fixed_inputs[6])
                 uncond_fixed_inputs = tuple(uncond_fixed_inputs)
             else:
                 uncond_fixed_inputs = uncond_inputs
@@ -180,7 +202,9 @@ class DenoiseActor(nn.Module):
 
         return torch.cat((trajectory, out[..., -1:]), -1)
 
-    def compute_trajectory(self, trajectory_mask, rgb3d, rgb2d, pcd, instruction, proprio, guidance_scale=2.0, uncond_inputs=None):
+    def compute_trajectory(self, trajectory_mask, rgb3d, rgb2d, pcd, instruction, proprio, guidance_scale=None, uncond_inputs=None):
+        if guidance_scale is None:
+            guidance_scale = self._guidance_scale
         fixed_inputs = self.encode_inputs(rgb3d, rgb2d, pcd, instruction, proprio)
         out_dim = 6 if self._rotation_format == 'euler' else 9
         trajectory = torch.randn(
@@ -194,6 +218,9 @@ class DenoiseActor(nn.Module):
             guidance_scale=guidance_scale,
             uncond_inputs=uncond_inputs
         )
+        # The normalizer bounds already include a workspace safety buffer.
+        # Prevent denoising overshoot from producing unreachable world poses.
+        trajectory[..., :3] = trajectory[..., :3].clamp(-1.0, 1.0)
         _, traj_len, nhand, _ = trajectory.shape
         trajectory = self.unconvert_rot(
             trajectory.flatten(1, 2)
@@ -214,7 +241,6 @@ class DenoiseActor(nn.Module):
             fixed_inputs_list = list(fixed_inputs)
             if torch.rand((), device=gt_trajectory.device) < self.cond_mask_prob:
                 fixed_inputs_list[5] = torch.zeros_like(fixed_inputs_list[5])
-                fixed_inputs_list[6] = torch.zeros_like(fixed_inputs_list[6])
             fixed_inputs = tuple(fixed_inputs_list)
 
         # Pool observation features once. Only the compact action head below
@@ -222,6 +248,8 @@ class DenoiseActor(nn.Module):
         condition = self.encode_condition(fixed_inputs)
 
         gt_openess = gt_trajectory[..., -1:]
+        gt_position_world = gt_trajectory[..., :3].float()
+        current_openess = proprio[:, -1:, :, -1:].float()
         gt_trajectory = self.normalize_pos(gt_trajectory[..., :-1])
         _, traj_len, nhand, _ = gt_trajectory.shape
         gt_trajectory = self.convert_rot(
@@ -269,10 +297,21 @@ class DenoiseActor(nn.Module):
                     u_target[..., 3:],
                     reduction='mean',
                 )
-                loss_openess = F.binary_cross_entropy_with_logits(
+                openess_loss = F.binary_cross_entropy_with_logits(
                     layer_prediction[..., -1:].float(),
                     gt_openess.float(),
+                    reduction='none',
                 )
+                transition = (
+                    (gt_openess.float() >= 0.5)
+                    != (current_openess >= 0.5)
+                ).to(dtype=openess_loss.dtype)
+                openess_weights = (
+                    1.0 + self._gripper_transition_weight * transition
+                )
+                loss_openess = (
+                    openess_loss * openess_weights
+                ).sum() / openess_weights.sum().clamp_min(1.0)
                 ivc_per_sample = (
                     u_prediction - velocity.float()
                 ).square().flatten(1).mean(1)
@@ -280,12 +319,47 @@ class DenoiseActor(nn.Module):
                 loss_ivc = (
                     ivc_per_sample * ivc_weights
                 ).sum() / ivc_weights.sum().clamp_min(1)
+
+                # Directly supervise the operation used by one-step MeanFlow
+                # inference. This gives exact-pose behavior a clean gradient
+                # instead of relying only on randomly sampled interior pairs.
+                endpoint_r = torch.zeros_like(t)
+                endpoint_t = torch.ones_like(t)
+                endpoint_prediction = self.policy_forward_pass(
+                    noise, endpoint_r, endpoint_t, condition
+                )[-1][..., :-1].float()
+                endpoint_reconstruction = noise.float() - endpoint_prediction
+                endpoint_position_world = self.unnormalize_pos(
+                    endpoint_reconstruction
+                )[..., :3]
+                loss_endpoint_position = 30 * F.smooth_l1_loss(
+                    endpoint_position_world,
+                    gt_position_world,
+                    beta=0.005,
+                )
+                pred_rotation = compute_rotation_matrix_from_ortho6d(
+                    endpoint_reconstruction[..., 3:].reshape(-1, 6)
+                )
+                gt_rotation = compute_rotation_matrix_from_ortho6d(
+                    gt_trajectory[..., 3:].float().reshape(-1, 6)
+                )
+                rotation_cosine = (
+                    (pred_rotation * gt_rotation).sum(dim=(-1, -2)) - 1.0
+                ) * 0.5
+                # 1-cos(theta) is a stable SO(3) endpoint objective whose scale
+                # reflects physical angular error rather than raw 6D distance.
+                loss_endpoint_rotation = 10 * (
+                    1.0 - rotation_cosine.clamp(-1.0, 1.0)
+                ).mean()
                 total_loss = (
                     total_loss
                     + loss_position
                     + loss_rotation
                     + loss_openess
-                    + 0.5 * loss_ivc
+                    + self._ivc_loss_weight * loss_ivc
+                    + self._endpoint_loss_weight * (
+                        loss_endpoint_position + loss_endpoint_rotation
+                    )
                 )
 
         return total_loss / self._lv2_batch_size
@@ -303,14 +377,18 @@ class DenoiseActor(nn.Module):
             chunk_size = batch_size
 
         directional_derivatives = []
-        with torch.no_grad():
+        # ``torch.func.jvp`` is exact AD, but it still inherits the outer BF16
+        # autocast. Run the compact FiLM-TCN target pass in FP32 so small action
+        # differences are not quantized before the derivative is formed.
+        device_type = z.device.type
+        with torch.no_grad(), torch.autocast(device_type=device_type, enabled=False):
             for start in range(0, batch_size, chunk_size):
                 end = min(start + chunk_size, batch_size)
-                z_chunk = z[start:end]
-                r_chunk = r[start:end]
-                t_chunk = t[start:end]
-                velocity_chunk = velocity[start:end]
-                condition_chunk = condition[start:end]
+                z_chunk = z[start:end].float()
+                r_chunk = r[start:end].float()
+                t_chunk = t[start:end].float()
+                velocity_chunk = velocity[start:end].float()
+                condition_chunk = condition[start:end].float()
 
                 def action_field(z_in, r_in, t_in):
                     return self.policy_forward_pass(
@@ -457,7 +535,12 @@ class DenoiseActor(nn.Module):
 
 
 class ConditionPooler(nn.Module):
-    """Attention-free pooling from encoder tokens to one condition vector."""
+    """Query-free relevance pooling from encoder tokens to one condition vector.
+
+    The FiLM-TCN action head remains attention-free. This pooler runs once,
+    outside the JVP path, and preserves target-related spatial information that
+    plain global mean pooling would otherwise erase.
+    """
 
     def __init__(self, embedding_dim=128, condition_dim=256):
         super().__init__()
@@ -468,6 +551,25 @@ class ConditionPooler(nn.Module):
             nn.Linear(embedding_dim, embedding_dim),
         )
         self.token_norm = nn.LayerNorm(embedding_dim)
+        self.relevance_score = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, 1),
+        )
+        self.spatial_moment_projection = nn.Sequential(
+            nn.LayerNorm(6),
+            nn.Linear(6, embedding_dim),
+        )
+        # Zero logits give uniform weights, exactly reproducing mean pooling
+        # when upgrading an existing 8.10 checkpoint.
+        nn.init.zeros_(self.relevance_score[-1].weight)
+        nn.init.zeros_(self.relevance_score[-1].bias)
+        # Keep old-checkpoint inference behavior unchanged. During new training
+        # this path learns to expose the metric centroid and spatial spread of
+        # relevant tokens instead of asking a global feature vector to recover
+        # millimeter-scale geometry implicitly.
+        nn.init.zeros_(self.spatial_moment_projection[-1].weight)
+        nn.init.zeros_(self.spatial_moment_projection[-1].bias)
 
         # mean + max pooling for each of: dense scene, sampled scene, 2D
         # scene, language and proprioception.
@@ -490,8 +592,27 @@ class ConditionPooler(nn.Module):
             position_features = self.position_projection(positions)
             tokens = tokens + position_features.to(dtype=tokens.dtype)
         tokens = self.token_norm(tokens)
+        scores = self.relevance_score(tokens).squeeze(-1)
+        weights_float = scores.float().softmax(dim=1)
+        weights = weights_float.to(dtype=tokens.dtype)
+        relevant = (tokens * weights.unsqueeze(-1)).sum(dim=1)
+        if positions is not None:
+            positions_float = positions.float()
+            centroid = (
+                positions_float * weights_float.unsqueeze(-1)
+            ).sum(dim=1)
+            centered = positions_float - centroid.unsqueeze(1)
+            spread = torch.sqrt(
+                (
+                    centered.square() * weights_float.unsqueeze(-1)
+                ).sum(dim=1).clamp_min(1e-8)
+            )
+            spatial_moments = torch.cat((centroid, spread), dim=-1)
+            relevant = relevant + self.spatial_moment_projection(
+                spatial_moments
+            ).to(dtype=relevant.dtype)
         return torch.cat(
-            (tokens.mean(dim=1), tokens.amax(dim=1)), dim=-1
+            (relevant, tokens.amax(dim=1)), dim=-1
         )
 
     def forward(

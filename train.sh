@@ -21,11 +21,11 @@ val_freq=4000
 eval_only=false
 lr=1e-4
 backbone_lr=1e-6  # doesn't matter when we don't finetune
-lr_scheduler=constant
-wd=1e-10
+lr_scheduler=cosine
+wd=1e-4
 train_iters=300000
 use_compile=false # much faster, but sometimes unstable
-use_ema=false
+use_ema=true
 lv2_batch_size=1  # you can increase this and divide B equally, speed/accuracy tradeoff
 
 # Model arguments, change (some of) these for new architectures
@@ -46,12 +46,22 @@ num_vis_instr_attn_layers=2
 num_history=3
 
 num_shared_attn_layers=4
+action_hidden_dim=256
+action_num_blocks=6
+jvp_microbatch_size=8
+guidance_scale=1.0
+endpoint_loss_weight=0.25
+ivc_loss_weight=0.0
+condition_dropout_prob=0.0
+gripper_transition_weight=2.0
 relative_action=false
 rotation_format=quat_xyzw
-denoise_timesteps=5
+denoise_timesteps=2
 denoise_model=meanflow
 
-run_log_dir=$model_type-$dataset-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model
+# Include the action-head/training recipe so an older Transformer checkpoint
+# can never be resumed accidentally through the same directory.
+run_log_dir=$model_type-$dataset-film_tcn_exact_jvp_v3_geom-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-S$denoise_timesteps-jvp$jvp_microbatch_size-ema$use_ema
 checkpoint=train_logs/${main_dir}/${run_log_dir}/last.pth
 
 # 开启可扩展段以减少显存碎片
@@ -98,6 +108,14 @@ torchrun --nproc_per_node $ngpus --master_port $RANDOM \
     --num_vis_instr_attn_layers $num_vis_instr_attn_layers \
     --num_history $num_history \
     --num_shared_attn_layers $num_shared_attn_layers \
+    --action_hidden_dim $action_hidden_dim \
+    --action_num_blocks $action_num_blocks \
+    --jvp_microbatch_size $jvp_microbatch_size \
+    --guidance_scale $guidance_scale \
+    --endpoint_loss_weight $endpoint_loss_weight \
+    --ivc_loss_weight $ivc_loss_weight \
+    --condition_dropout_prob $condition_dropout_prob \
+    --gripper_transition_weight $gripper_transition_weight \
     --workspace_normalizer_buffer $workspace_normalizer_buffer \
     --relative_action $relative_action \
     --rotation_format $rotation_format \

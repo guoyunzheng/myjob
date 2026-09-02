@@ -6,6 +6,7 @@ from torchvision.ops import Conv2dNormActivation
 
 from ...utils.position_encodings import RotaryPositionEncoding3D, SinusoidalPosEmb
 from ...utils.layers import AttentionModule
+from ...utils.utils import normalise_quat, quaternion_to_matrix
 from ..vision.fpn import EfficientFeaturePyramidNetwork
 from .base_encoder import Encoder as BaseEncoder
 
@@ -46,6 +47,15 @@ class Encoder(BaseEncoder):
 
         # Proprioception learnable encoding if 3D is used
         self.curr_gripper_embed = nn.Embedding(nhist, embedding_dim)
+        self.proprio_state_encoder = nn.Sequential(
+            nn.LayerNorm(10),
+            nn.Linear(10, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
+        # Preserve the 8.10 checkpoint's behavior until this branch is trained.
+        nn.init.zeros_(self.proprio_state_encoder[-1].weight)
+        nn.init.zeros_(self.proprio_state_encoder[-1].bias)
         self.gripper_context_head = AttentionModule(
             num_layers=3, d_model=embedding_dim, dim_fw=embedding_dim,
             n_heads=num_attn_heads, rotary_pe=True, use_adaln=False,
@@ -72,6 +82,20 @@ class Encoder(BaseEncoder):
         proprio_feats = self.curr_gripper_embed.weight.unsqueeze(0).repeat(
             len(proprio), 1, 1
         )
+        if proprio.shape[-1] != 8:
+            raise ValueError(
+                "RLBench proprioception must contain position, quaternion, "
+                f"and gripper openness (8 values); got {proprio.shape[-1]}."
+            )
+        # Use a sign-invariant continuous 6D orientation instead of feeding
+        # xyzw quaternion components directly (q and -q are the same pose).
+        quat_wxyz = normalise_quat(proprio[..., 3:7])[..., (3, 0, 1, 2)]
+        rotation_matrix = quaternion_to_matrix(quat_wxyz)
+        rotation_6d = rotation_matrix[..., :, :2].transpose(-2, -1).flatten(-2)
+        proprio_state = torch.cat(
+            (proprio[..., :3], rotation_6d, proprio[..., 7:8]), dim=-1
+        )
+        proprio_feats = proprio_feats + self.proprio_state_encoder(proprio_state)
 
         # Rotary positional encoding
         proprio_pos = self.relative_pe_layer(proprio[..., :3])
@@ -104,6 +128,7 @@ class Encoder(BaseEncoder):
         # Encode language
         instruction = self.text_encoder(text)
         instr_feats = self.instruction_encoder(instruction)
+        instr_padding_mask = self.instruction_padding_mask(text)
 
         # 3D camera features
         num_cameras = rgb3d.shape[1]
@@ -120,7 +145,11 @@ class Encoder(BaseEncoder):
             "(bt ncam) c h w -> bt (ncam h w) c", ncam=num_cameras
         )
         # Attention from vision to language
-        rgb3d_feats = self.vl_attention(seq1=rgb3d_feats, seq2=instr_feats)[-1]
+        rgb3d_feats = self.vl_attention(
+            seq1=rgb3d_feats,
+            seq2=instr_feats,
+            seq2_key_padding_mask=instr_padding_mask,
+        )[-1]
 
         # Point cloud
         num_cameras = pcd.shape[1]
@@ -128,7 +157,9 @@ class Encoder(BaseEncoder):
         pcd = F.interpolate(
             einops.rearrange(pcd, "bt ncam c h w -> (bt ncam) c h w"),
             (feat_h, feat_w),
-            mode='bilinear'
+            # A point cloud is not a color image: bilinear interpolation creates
+            # non-physical points across object/background depth boundaries.
+            mode='nearest'
         )
         # Merge different cameras
         pcd = einops.rearrange(
