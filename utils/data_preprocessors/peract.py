@@ -47,6 +47,9 @@ class PeractDataPreprocessor(DataPreprocessor):
                 size=(orig_imsize, orig_imsize),
                 scale=(0.95, 1.0),
                 resample="nearest",
+                # The slice crop ends in F.interpolate, where nearest mode
+                # requires align_corners=None (Kornia defaults to True).
+                align_corners=None,
                 p=0.1
             )
         ).cuda()
