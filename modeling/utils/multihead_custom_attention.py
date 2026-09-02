@@ -54,9 +54,13 @@ class MultiheadCustomAttention(nn.MultiheadAttention):
         # merge key padding and attention masks
         if key_padding_mask is not None:
             bsz, src_len = key_padding_mask.shape
+            # ``scaled_dot_product_attention`` receives q/k/v as
+            # (B, H, S, D), so its mask must remain broadcastable to
+            # (B, H, target_len, source_len).  Flattening B and H here follows
+            # nn.MultiheadAttention's legacy 3D-mask convention and is not
+            # compatible with the direct 4D SDPA call below.
             key_padding_mask = key_padding_mask.view(bsz, 1, 1, src_len)
             key_padding_mask = key_padding_mask.expand(-1, self.num_heads, -1, -1)
-            key_padding_mask = key_padding_mask.reshape(bsz * self.num_heads, 1, src_len)
             if attn_mask is None:
                 attn_mask = key_padding_mask
             else:
