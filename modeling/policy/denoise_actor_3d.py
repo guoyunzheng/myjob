@@ -33,7 +33,10 @@ class DenoiseActor(BaseDenoiseActor):
                  endpoint_loss_weight=0.25,
                  ivc_loss_weight=0.0,
                  condition_dropout_prob=0.0,
-                 gripper_transition_weight=2.0):
+                 gripper_transition_weight=2.0,
+                 gripper_closed_hold_weight=2.0,
+                 gripper_prediction_mode="direct",
+                 gripper_hold_prior_logit=2.0):
         super().__init__(
             embedding_dim=embedding_dim,
             num_attn_heads=num_attn_heads,
@@ -53,6 +56,9 @@ class DenoiseActor(BaseDenoiseActor):
             ivc_loss_weight=ivc_loss_weight,
             condition_dropout_prob=condition_dropout_prob,
             gripper_transition_weight=gripper_transition_weight,
+            gripper_closed_hold_weight=gripper_closed_hold_weight,
+            gripper_prediction_mode=gripper_prediction_mode,
+            gripper_hold_prior_logit=gripper_hold_prior_logit,
         )
 
         # Vision-language encoder, runs only once

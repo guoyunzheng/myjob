@@ -25,6 +25,9 @@ max_tries=2
 max_steps=25
 headless=true
 collision_checking=false
+gripper_open_threshold=0.75
+gripper_close_threshold=0.25
+require_pose_for_gripper_change=True
 seed=0
 
 # Dataset arguments
@@ -60,6 +63,9 @@ for ((i=0; i<$num_ckpts; i++)); do
         --max_steps $max_steps \
         --headless $headless \
         --collision_checking $collision_checking \
+        --gripper_open_threshold $gripper_open_threshold \
+        --gripper_close_threshold $gripper_close_threshold \
+        --require_pose_for_gripper_change $require_pose_for_gripper_change \
         --seed $seed \
         --data_dir $data_dir \
         --dataset $dataset \
@@ -75,6 +81,7 @@ for ((i=0; i<$num_ckpts; i++)); do
         --num_vis_instr_attn_layers $num_vis_instr_attn_layers \
         --num_history $num_history \
         --num_shared_attn_layers $num_shared_attn_layers \
+        --gripper_prediction_mode auto \
         --relative_action $relative_action \
         --rotation_format $rotation_format \
         --denoise_timesteps $denoise_timesteps \

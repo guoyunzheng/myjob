@@ -60,6 +60,9 @@ endpoint_loss_weight=0.25
 ivc_loss_weight=0.0
 condition_dropout_prob=0.0
 gripper_transition_weight=2.0
+gripper_closed_hold_weight=2.0
+gripper_prediction_mode=direct
+gripper_hold_prior_logit=2.0
 relative_action=false
 rotation_format=quat_xyzw
 denoise_timesteps=2
@@ -67,7 +70,7 @@ denoise_model=meanflow
 
 # Include the action-head/training recipe so an older Transformer checkpoint
 # can never be resumed accidentally through the same directory.
-run_log_dir=$model_type-$dataset-film_tcn_exact_jvp_v3_geom-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-S$denoise_timesteps-jvp$jvp_microbatch_size-ema$use_ema
+run_log_dir=$model_type-$dataset-film_tcn_exact_jvp_v4_gripdirect-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-S$denoise_timesteps-jvp$jvp_microbatch_size-ema$use_ema
 checkpoint=train_logs/${main_dir}/${run_log_dir}/last.pth
 
 # 开启可扩展段以减少显存碎片
@@ -122,6 +125,9 @@ torchrun --nproc_per_node $ngpus --master_port $RANDOM \
     --ivc_loss_weight $ivc_loss_weight \
     --condition_dropout_prob $condition_dropout_prob \
     --gripper_transition_weight $gripper_transition_weight \
+    --gripper_closed_hold_weight $gripper_closed_hold_weight \
+    --gripper_prediction_mode $gripper_prediction_mode \
+    --gripper_hold_prior_logit $gripper_hold_prior_logit \
     --workspace_normalizer_buffer $workspace_normalizer_buffer \
     --relative_action $relative_action \
     --rotation_format $rotation_format \

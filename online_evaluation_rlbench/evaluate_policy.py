@@ -26,6 +26,9 @@ def parse_arguments():
         ('max_steps', int, 25),
         ('headless', str2bool, False),
         ('collision_checking', str2bool, False),
+        ('gripper_open_threshold', float, 0.75),
+        ('gripper_close_threshold', float, 0.25),
+        ('require_pose_for_gripper_change', str2bool, True),
         ('seed', int, 0),
         # Dataset arguments
         ('data_dir', Path, Path(__file__).parent / "demos"),
@@ -50,6 +53,7 @@ def parse_arguments():
         ('action_hidden_dim', int, 256),
         ('action_num_blocks', int, 6),
         ('guidance_scale', float, 1.0),
+        ('gripper_prediction_mode', str, 'auto'),
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_xyzw'),
         ('denoise_timesteps', int, 2),
@@ -63,6 +67,24 @@ def parse_arguments():
 
 def load_models(args):
     print("Loading model from", args.checkpoint, flush=True)
+
+    model_dict = torch.load(
+        args.checkpoint, map_location="cpu", weights_only=True
+    )
+    checkpoint_config = model_dict.get("config") or {}
+    trained_gripper_mode = checkpoint_config.get(
+        "gripper_prediction_mode", "legacy_denoise"
+    )
+    gripper_mode = (
+        trained_gripper_mode
+        if args.gripper_prediction_mode == "auto"
+        else args.gripper_prediction_mode
+    )
+    if gripper_mode != trained_gripper_mode:
+        raise ValueError(
+            "Checkpoint gripper mode mismatch: trained with "
+            f"{trained_gripper_mode!r}, requested {gripper_mode!r}."
+        )
 
     model_class = fetch_model_class(args.model_type)
     model_kwargs = dict(
@@ -84,14 +106,13 @@ def load_models(args):
             action_hidden_dim=args.action_hidden_dim,
             action_num_blocks=args.action_num_blocks,
             guidance_scale=args.guidance_scale,
+            gripper_prediction_mode=gripper_mode,
+            gripper_hold_prior_logit=float(
+                checkpoint_config.get("gripper_hold_prior_logit", 2.0)
+            ),
         )
     model = model_class(**model_kwargs)
 
-    # Load model weights
-    model_dict = torch.load(
-        args.checkpoint, map_location="cpu", weights_only=True
-    )
-    checkpoint_config = model_dict.get("config")
     if checkpoint_config:
         if checkpoint_config.get("denoise_model") != args.denoise_model:
             raise ValueError(
@@ -130,11 +151,14 @@ def load_models(args):
             "encoder.proprio_state_encoder.",
             "condition_pooler.relevance_score.",
             "condition_pooler.spatial_moment_projection.",
+            "condition_pooler.secondary_relevance_score.",
+            "condition_pooler.secondary_slot_projection.",
         ),
     )
     print(
         f"Loaded {weight_name} weights strictly "
-        f"(training step {model_dict.get('iter', 'unknown')})."
+        f"(training step {model_dict.get('iter', 'unknown')}, "
+        f"gripper mode {gripper_mode})."
     )
     model.eval()
 
@@ -176,7 +200,7 @@ if __name__ == "__main__":
         random.seed(args.seed)
 
         # Load RLBench environment
-        env = RLBenchEnv(
+        env_kwargs = dict(
             data_path=args.data_dir,
             task_str=task_str,
             image_size=[int(x) for x in args.image_size.split(",")],
@@ -184,8 +208,17 @@ if __name__ == "__main__":
             apply_pc=True,
             headless=bool(args.headless),
             apply_cameras=dataset_class.cameras,
-            collision_checking=bool(args.collision_checking)
+            collision_checking=bool(args.collision_checking),
         )
+        if not args.bimanual and "peract" in args.dataset.lower():
+            env_kwargs.update(
+                gripper_open_threshold=args.gripper_open_threshold,
+                gripper_close_threshold=args.gripper_close_threshold,
+                require_pose_for_gripper_change=(
+                    args.require_pose_for_gripper_change
+                ),
+            )
+        env = RLBenchEnv(**env_kwargs)
 
         # Actioner (runs the policy online)
         actioner = Actioner(model, backbone=args.backbone)

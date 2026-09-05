@@ -6,6 +6,7 @@ from torch.func import jvp
 from ..noise_scheduler import fetch_schedulers
 from ..utils.layers import AttentionModule
 from ..utils.position_encodings import SinusoidalPosEmb
+from .gripper_head import GripperStateHead
 from ..utils.utils import (
     compute_rotation_matrix_from_ortho6d,
     get_ortho6d_from_rotation_matrix,
@@ -37,12 +38,24 @@ class DenoiseActor(nn.Module):
                  endpoint_loss_weight=0.25,
                  ivc_loss_weight=0.0,
                  condition_dropout_prob=0.0,
-                 gripper_transition_weight=2.0):
+                 gripper_transition_weight=2.0,
+                 gripper_closed_hold_weight=2.0,
+                 gripper_prediction_mode="legacy_denoise",
+                 gripper_hold_prior_logit=2.0):
         super().__init__()
         if not 0.0 <= condition_dropout_prob <= 1.0:
             raise ValueError("condition_dropout_prob must be in [0, 1].")
         if gripper_transition_weight < 0.0:
             raise ValueError("gripper_transition_weight must be non-negative.")
+        if gripper_closed_hold_weight < 0.0:
+            raise ValueError("gripper_closed_hold_weight must be non-negative.")
+        if gripper_prediction_mode not in {"direct", "legacy_denoise"}:
+            raise ValueError(
+                "gripper_prediction_mode must be 'direct' or "
+                "'legacy_denoise'."
+            )
+        if gripper_hold_prior_logit < 0.0:
+            raise ValueError("gripper_hold_prior_logit must be non-negative.")
         # Arguments to be accessed by the main class
         self._rotation_format = rotation_format
         self._relative = relative
@@ -52,6 +65,8 @@ class DenoiseActor(nn.Module):
         self._endpoint_loss_weight = endpoint_loss_weight
         self._ivc_loss_weight = ivc_loss_weight
         self._gripper_transition_weight = gripper_transition_weight
+        self._gripper_closed_hold_weight = gripper_closed_hold_weight
+        self._gripper_prediction_mode = gripper_prediction_mode
 
         # Vision-language encoder, runs only once
         self.encoder = None  # Implement this!
@@ -73,6 +88,15 @@ class DenoiseActor(nn.Module):
             num_blocks=action_num_blocks,
             nhand=nhand,
             rot_dim=3 if rotation_format == 'euler' else 6,
+        )
+        self.gripper_state_head = (
+            GripperStateHead(
+                condition_dim=action_hidden_dim,
+                hidden_dim=action_hidden_dim,
+                hold_prior_logit=gripper_hold_prior_logit,
+            )
+            if gripper_prediction_mode == "direct"
+            else None
         )
 
         # Noise/denoise schedulers and hyperparameters
@@ -144,6 +168,43 @@ class DenoiseActor(nn.Module):
                 condition.float(),
             )
 
+    def predict_gripper_logits(self, condition, current_openess, traj_len):
+        """Predict target gripper state without diffusion-time dependence."""
+        if self.gripper_state_head is None:
+            raise RuntimeError(
+                "Direct gripper prediction requested in legacy_denoise mode."
+            )
+        # current_openess is (B, nhand, 1). The target data currently contains
+        # one keypose; expanding keeps the public trajectory shape general.
+        with torch.autocast(
+            device_type=condition.device.type,
+            enabled=False,
+        ):
+            logits = self.gripper_state_head(
+                condition.float(), current_openess.float()
+            )
+        return logits.unsqueeze(1).expand(-1, traj_len, -1, -1)
+
+    def compute_gripper_loss(self, logits, target_openess, current_openess):
+        """Cost-sensitive BCE that protects a closed gripper during transport."""
+        elementwise_loss = F.binary_cross_entropy_with_logits(
+            logits.float(), target_openess.float(), reduction='none'
+        )
+        target_is_open = target_openess.float() >= 0.5
+        current_is_open = current_openess.float() >= 0.5
+        transition = (target_is_open != current_is_open).to(
+            dtype=elementwise_loss.dtype
+        )
+        closed_hold = (~target_is_open & ~current_is_open).to(
+            dtype=elementwise_loss.dtype
+        )
+        weights = (
+            1.0
+            + self._gripper_transition_weight * transition
+            + self._gripper_closed_hold_weight * closed_hold
+        )
+        return (elementwise_loss * weights).sum() / weights.sum().clamp_min(1.0)
+
     def conditional_sample(self, trajectory, device, fixed_inputs, guidance_scale=1.0, uncond_inputs=None):
         self.position_scheduler.set_timesteps(self.n_steps, device=device)
         self.rotation_scheduler.set_timesteps(self.n_steps, device=device)
@@ -200,7 +261,14 @@ class DenoiseActor(nn.Module):
             ).prev_sample
             trajectory = torch.cat((pos, rot), -1)
 
-        return torch.cat((trajectory, out[..., -1:]), -1)
+        if self._gripper_prediction_mode == "direct":
+            current_openess = fixed_inputs[0][:, -1, :, -1:]
+            gripper_logits = self.predict_gripper_logits(
+                condition, current_openess, trajectory.shape[1]
+            )
+        else:
+            gripper_logits = out[..., -1:]
+        return torch.cat((trajectory, gripper_logits), -1)
 
     def compute_trajectory(self, trajectory_mask, rgb3d, rgb2d, pcd, instruction, proprio, guidance_scale=None, uncond_inputs=None):
         if guidance_scale is None:
@@ -256,6 +324,17 @@ class DenoiseActor(nn.Module):
             gt_trajectory.flatten(1, 2)
         ).unflatten(1, (traj_len, nhand))
 
+        direct_gripper_loss = None
+        if self._gripper_prediction_mode == "direct":
+            direct_gripper_logits = self.predict_gripper_logits(
+                condition,
+                current_openess[:, -1],
+                traj_len,
+            )
+            direct_gripper_loss = self.compute_gripper_loss(
+                direct_gripper_logits, gt_openess, current_openess
+            )
+
         total_loss = 0
         for _ in range(self._lv2_batch_size):
             noise = torch.randn_like(gt_trajectory)
@@ -297,21 +376,14 @@ class DenoiseActor(nn.Module):
                     u_target[..., 3:],
                     reduction='mean',
                 )
-                openess_loss = F.binary_cross_entropy_with_logits(
-                    layer_prediction[..., -1:].float(),
-                    gt_openess.float(),
-                    reduction='none',
-                )
-                transition = (
-                    (gt_openess.float() >= 0.5)
-                    != (current_openess >= 0.5)
-                ).to(dtype=openess_loss.dtype)
-                openess_weights = (
-                    1.0 + self._gripper_transition_weight * transition
-                )
-                loss_openess = (
-                    openess_loss * openess_weights
-                ).sum() / openess_weights.sum().clamp_min(1.0)
+                if self._gripper_prediction_mode == "legacy_denoise":
+                    loss_openess = self.compute_gripper_loss(
+                        layer_prediction[..., -1:],
+                        gt_openess,
+                        current_openess,
+                    )
+                else:
+                    loss_openess = layer_prediction.new_zeros(())
                 ivc_per_sample = (
                     u_prediction - velocity.float()
                 ).square().flatten(1).mean(1)
@@ -320,15 +392,39 @@ class DenoiseActor(nn.Module):
                     ivc_per_sample * ivc_weights
                 ).sum() / ivc_weights.sum().clamp_min(1)
 
-                # Directly supervise the operation used by one-step MeanFlow
-                # inference. This gives exact-pose behavior a clean gradient
-                # instead of relying only on randomly sampled interior pairs.
-                endpoint_r = torch.zeros_like(t)
-                endpoint_t = torch.ones_like(t)
-                endpoint_prediction = self.policy_forward_pass(
-                    noise, endpoint_r, endpoint_t, condition
-                )[-1][..., :-1].float()
-                endpoint_reconstruction = noise.float() - endpoint_prediction
+                # Supervise the exact multi-step solver used at evaluation.
+                # The previous one-step endpoint objective did not match a
+                # two- or five-step rollout and could improve its own loss
+                # while the executed endpoint remained imprecise.
+                self.position_scheduler.set_timesteps(
+                    self.n_steps, device=noise.device
+                )
+                endpoint_reconstruction = noise.float()
+                for endpoint_t, endpoint_r in zip(
+                    self.position_scheduler.timesteps,
+                    self.position_scheduler.prev_timesteps,
+                ):
+                    endpoint_prediction = self.policy_forward_pass(
+                        endpoint_reconstruction,
+                        endpoint_r.expand(len(noise)),
+                        endpoint_t.expand(len(noise)),
+                        condition,
+                    )[-1][..., :-1].float()
+                    endpoint_pos = self.position_scheduler.step(
+                        endpoint_prediction[..., :3],
+                        endpoint_t,
+                        endpoint_r,
+                        endpoint_reconstruction[..., :3],
+                    ).prev_sample
+                    endpoint_rot = self.rotation_scheduler.step(
+                        endpoint_prediction[..., 3:],
+                        endpoint_t,
+                        endpoint_r,
+                        endpoint_reconstruction[..., 3:],
+                    ).prev_sample
+                    endpoint_reconstruction = torch.cat(
+                        (endpoint_pos, endpoint_rot), dim=-1
+                    )
                 endpoint_position_world = self.unnormalize_pos(
                     endpoint_reconstruction
                 )[..., :3]
@@ -362,7 +458,10 @@ class DenoiseActor(nn.Module):
                     )
                 )
 
-        return total_loss / self._lv2_batch_size
+        total_loss = total_loss / self._lv2_batch_size
+        if direct_gripper_loss is not None:
+            total_loss = total_loss + direct_gripper_loss
+        return total_loss
 
     def compute_meanflow_target(self, z, r, t, velocity, condition):
         """Construct the stop-gradient target using the exact MeanFlow JVP.
@@ -556,6 +655,25 @@ class ConditionPooler(nn.Module):
             nn.SiLU(),
             nn.Linear(embedding_dim, 1),
         )
+        # A single softmax centroid tends to land between the grasped object
+        # and its matching receptacle. Two additional learned slots preserve
+        # separate object/target anchors while keeping the action head's fixed
+        # condition-vector interface and exact-JVP memory profile unchanged.
+        self.num_secondary_slots = 2
+        self.secondary_relevance_score = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, self.num_secondary_slots),
+        )
+        secondary_summary_dim = self.num_secondary_slots * (
+            embedding_dim + 6
+        )
+        self.secondary_slot_projection = nn.Sequential(
+            nn.LayerNorm(secondary_summary_dim),
+            nn.Linear(secondary_summary_dim, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
         self.spatial_moment_projection = nn.Sequential(
             nn.LayerNorm(6),
             nn.Linear(6, embedding_dim),
@@ -570,6 +688,11 @@ class ConditionPooler(nn.Module):
         # millimeter-scale geometry implicitly.
         nn.init.zeros_(self.spatial_moment_projection[-1].weight)
         nn.init.zeros_(self.spatial_moment_projection[-1].bias)
+        # This zero residual makes old checkpoints behavior preserving even
+        # though their newly initialized slot scorers are intentionally
+        # asymmetric. New training quickly learns the residual projection.
+        nn.init.zeros_(self.secondary_slot_projection[-1].weight)
+        nn.init.zeros_(self.secondary_slot_projection[-1].bias)
 
         # mean + max pooling for each of: dense scene, sampled scene, 2D
         # scene, language and proprioception.
@@ -611,6 +734,43 @@ class ConditionPooler(nn.Module):
             relevant = relevant + self.spatial_moment_projection(
                 spatial_moments
             ).to(dtype=relevant.dtype)
+        secondary_scores = self.secondary_relevance_score(tokens)
+        secondary_weights_float = secondary_scores.float().softmax(dim=1)
+        secondary_weights = secondary_weights_float.to(dtype=tokens.dtype)
+        secondary_features = torch.einsum(
+            "bns,bne->bse", secondary_weights, tokens
+        )
+        if positions is not None:
+            positions_float = positions.float()
+            secondary_centroids = torch.einsum(
+                "bns,bnd->bsd", secondary_weights_float, positions_float
+            )
+            secondary_centered = (
+                positions_float.unsqueeze(2)
+                - secondary_centroids.unsqueeze(1)
+            )
+            secondary_spreads = torch.sqrt(
+                torch.einsum(
+                    "bns,bnsd->bsd",
+                    secondary_weights_float,
+                    secondary_centered.square(),
+                ).clamp_min(1e-8)
+            )
+            secondary_moments = torch.cat(
+                (secondary_centroids, secondary_spreads), dim=-1
+            ).to(dtype=secondary_features.dtype)
+        else:
+            secondary_moments = secondary_features.new_zeros(
+                secondary_features.shape[0],
+                self.num_secondary_slots,
+                6,
+            )
+        secondary_summary = torch.cat(
+            (secondary_features, secondary_moments), dim=-1
+        ).flatten(1)
+        relevant = relevant + self.secondary_slot_projection(
+            secondary_summary.float()
+        ).to(dtype=relevant.dtype)
         return torch.cat(
             (relevant, tokens.amax(dim=1)), dim=-1
         )

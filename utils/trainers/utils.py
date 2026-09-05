@@ -22,7 +22,7 @@ def compute_task_balanced_selection(task_scores, worst_fraction=0.25):
     return macro_score, worst_score, combined_score
 
 
-def compute_metrics(pred, gt):
+def compute_metrics(pred, gt, current_openess=None):
     # pred/gt are (B, L, 3+rot+1)
     pos_l2 = ((pred[..., :3] - gt[..., :3]) ** 2).sum(-1).sqrt()
     # symmetric quaternion eval
@@ -36,10 +36,23 @@ def compute_metrics(pred, gt):
     rot_rad = 2.0 * torch.acos(quat_dot)
     rot_deg = torch.rad2deg(rot_rad)
     # gripper openess
-    openess = ((pred[..., -1:] >= 0.5) == (gt[..., -1:] >= 0.5)).bool()
-    gripper_error = (~openess).squeeze(-1).float()
-    # A 1 radian rotation error and a wrong gripper each count as 1 cm.
-    score = pos_l2 + 0.01 * rot_rad + 0.01 * gripper_error
+    pred_is_open = pred[..., -1:] >= 0.5
+    gt_is_open = gt[..., -1:] >= 0.5
+    openess = (pred_is_open == gt_is_open).bool()
+    false_open = (pred_is_open & ~gt_is_open).squeeze(-1).float()
+    false_close = (~pred_is_open & gt_is_open).squeeze(-1).float()
+    # Releasing a carried object is usually irreversible, so checkpoint
+    # selection penalizes false opening more than a delayed opening.
+    score = pos_l2 + 0.01 * rot_rad + 0.05 * false_open + 0.01 * false_close
+    closed_hold_false_open = None
+    closed_hold_fraction = None
+    if current_openess is not None:
+        current_is_open = current_openess >= 0.5
+        closed_hold = (~current_is_open & ~gt_is_open)
+        closed_hold_false_open = (
+            pred_is_open & closed_hold
+        ).squeeze(-1).float()
+        closed_hold_fraction = closed_hold.squeeze(-1).float()
     tr = 'traj_'
 
     # Trajectory metrics
@@ -53,6 +66,8 @@ def compute_metrics(pred, gt):
         tr + 'rot_deg': rot_deg.mean(),
         tr + 'rot_acc_5deg': (rot_deg < 5.0).float().mean(),
         tr + 'gripper': openess.flatten().float().mean(),
+        tr + 'gripper_false_open': false_open.mean(),
+        tr + 'gripper_false_close': false_close.mean(),
         tr + 'score': score.mean(),
     }, {
         tr + 'pos_l2': pos_l2.mean(-1),
@@ -64,7 +79,14 @@ def compute_metrics(pred, gt):
         tr + 'rot_deg': rot_deg.mean(-1),
         tr + 'rot_acc_5deg': (rot_deg < 5.0).float().mean(-1),
         tr + 'gripper': openess.flatten(-2).float().mean(-1),
+        tr + 'gripper_false_open': false_open.mean(-1),
+        tr + 'gripper_false_close': false_close.mean(-1),
         tr + 'score': score.mean(-1),
     }
+    if closed_hold_false_open is not None:
+        ret_1[tr + 'closed_hold_false_open'] = closed_hold_false_open.mean()
+        ret_1[tr + 'closed_hold_fraction'] = closed_hold_fraction.mean()
+        ret_2[tr + 'closed_hold_false_open'] = closed_hold_false_open.mean(-1)
+        ret_2[tr + 'closed_hold_fraction'] = closed_hold_fraction.mean(-1)
 
     return ret_1, ret_2

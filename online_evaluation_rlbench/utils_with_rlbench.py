@@ -20,6 +20,9 @@ from pyrep.const import RenderMode
 
 from modeling.encoder.text import fetch_tokenizers
 from online_evaluation_rlbench.get_stored_demos import get_stored_demos
+from online_evaluation_rlbench.gripper_control import (
+    hysteresis_gripper_command,
+)
 
 
 def task_file_to_task_class(task_file):
@@ -35,13 +38,34 @@ def task_file_to_task_class(task_file):
 
 class Mover:
 
-    def __init__(self, task, max_tries=1):
+    def __init__(
+        self,
+        task,
+        max_tries=1,
+        initial_action=None,
+        gripper_close_threshold=0.25,
+        gripper_open_threshold=0.75,
+        require_pose_for_gripper_change=True,
+    ):
         self._task = task
-        self._last_action = None
+        self._last_action = (
+            None if initial_action is None else initial_action.copy()
+        )
         self._max_tries = max_tries
+        self._gripper_close_threshold = gripper_close_threshold
+        self._gripper_open_threshold = gripper_open_threshold
+        self._require_pose_for_gripper_change = (
+            require_pose_for_gripper_change
+        )
         self.last_position_error = float("nan")
         self.last_rotation_error_deg = float("nan")
         self.last_attempts = 0
+        self.last_pose_reached = False
+        self.last_gripper_probability = float("nan")
+        self.last_gripper_command = float("nan")
+        self.last_gripper_change_requested = False
+        self.last_gripper_change_executed = False
+        self.last_gripper_change_suppressed = False
 
     @staticmethod
     def _rotation_error_deg(target_quat, actual_quat):
@@ -60,10 +84,33 @@ class Mover:
         terminate = None
         reward = 0
 
-        # Try to reach the desired pose without changing the gripper state
+        # Resolve the probabilistic output while preserving the measured state
+        # inside an uncertainty band. Evaluation normally supplies an initial
+        # action from the reset observation; retain a safe fallback for callers
+        # that do not.
         target = action.copy()
-        if self._last_action is not None:
-            action[7] = self._last_action[7].copy()
+        self.last_gripper_probability = float(np.clip(target[7], 0.0, 1.0))
+        current_gripper = (
+            float(self._last_action[7])
+            if self._last_action is not None
+            else (1.0 if self.last_gripper_probability >= 0.5 else 0.0)
+        )
+        target_gripper = hysteresis_gripper_command(
+            self.last_gripper_probability,
+            current_gripper,
+            close_threshold=self._gripper_close_threshold,
+            open_threshold=self._gripper_open_threshold,
+        )
+        target[7] = target_gripper
+        self.last_gripper_command = target_gripper
+        self.last_gripper_change_requested = target_gripper != current_gripper
+        self.last_gripper_change_executed = False
+        self.last_gripper_change_suppressed = False
+
+        # Reach the desired arm pose while holding the current gripper state.
+        action = target.copy()
+        action[7] = current_gripper
+        self.last_pose_reached = False
         for attempt in range(1, self._max_tries + 1):
             action_collision = np.ones(action.shape[0]+1)
             action_collision[:-1] = action
@@ -83,23 +130,37 @@ class Mover:
             criteria = (dist_pos < 5e-3, dist_rot < 5.0)
 
             if all(criteria) or reward == 1:
+                self.last_pose_reached = all(criteria)
                 break
 
-        # Then execute with gripper action (open/close))
-        action = target
+        # Execute a state change only after reaching the requested pose. A
+        # failed planner attempt must never turn a slightly wrong prediction
+        # into an irreversible object release.
+        allow_gripper_change = (
+            self.last_pose_reached
+            or not self._require_pose_for_gripper_change
+        )
         if (
-            not reward == 1.0
-            and self._last_action is not None
-            and action[7] != self._last_action[7]
+            reward != 1.0
+            and self.last_gripper_change_requested
+            and allow_gripper_change
         ):
             action_collision = np.ones(action.shape[0]+1)
-            action_collision[:-1] = action
+            action_collision[:-1] = target
             if collision_checking:
                 action_collision[-1] = 0
             obs, reward, terminate = self._task.step(action_collision)
+            self.last_gripper_change_executed = True
+        elif self.last_gripper_change_requested and not allow_gripper_change:
+            self.last_gripper_change_suppressed = True
 
-        # Store the last action action for the gripper state
-        self._last_action = action.copy()
+        # Track the actually observed state, not an unexecuted target command.
+        stored_action = target.copy()
+        if obs is not None:
+            stored_action[7] = float(obs.gripper_open)
+        else:
+            stored_action[7] = current_gripper
+        self._last_action = stored_action
 
         return obs, reward, terminate
 
@@ -151,7 +212,10 @@ class RLBenchEnv:
         apply_pc=False,
         headless=False,
         apply_cameras=("left_shoulder", "right_shoulder", "wrist", "front"),
-        collision_checking=False
+        collision_checking=False,
+        gripper_close_threshold=0.25,
+        gripper_open_threshold=0.75,
+        require_pose_for_gripper_change=True,
     ):
 
         # setup required inputs
@@ -161,6 +225,14 @@ class RLBenchEnv:
         self.apply_pc = apply_pc
         self.apply_cameras = apply_cameras
         self.collision_checking = collision_checking
+        if not 0.0 <= gripper_close_threshold < gripper_open_threshold <= 1.0:
+            raise ValueError(
+                "Expected 0 <= gripper_close_threshold < "
+                "gripper_open_threshold <= 1."
+            )
+        self.gripper_close_threshold = gripper_close_threshold
+        self.gripper_open_threshold = gripper_open_threshold
+        self.require_pose_for_gripper_change = require_pose_for_gripper_change
 
         # setup RLBench environments
         self.obs_config = self.create_obs_config(
@@ -308,12 +380,27 @@ class RLBenchEnv:
             descriptions, obs = task.reset_to_demo(demo)
             actioner.load_episode(descriptions)
 
-            move = Mover(task, max_tries=max_tries)
+            initial_action = np.concatenate(
+                (obs.gripper_pose, [obs.gripper_open])
+            )
+            move = Mover(
+                task,
+                max_tries=max_tries,
+                initial_action=initial_action,
+                gripper_close_threshold=self.gripper_close_threshold,
+                gripper_open_threshold=self.gripper_open_threshold,
+                require_pose_for_gripper_change=(
+                    self.require_pose_for_gripper_change
+                ),
+            )
             max_reward = 0.0
             execution_position_errors = []
             execution_rotation_errors = []
             execution_attempts = []
             num_action_errors = 0
+            gripper_probabilities = []
+            gripper_changes = 0
+            suppressed_gripper_changes = 0
 
             for step_id in range(max_steps):
 
@@ -342,7 +429,6 @@ class RLBenchEnv:
                 try:
                     # Execute entire predicted trajectory step by step
                     actions = output[-1].cpu().numpy()
-                    actions[:, -1] = actions[:, -1].round()
 
                     # execute
                     for action in actions:
@@ -353,6 +439,25 @@ class RLBenchEnv:
                         execution_position_errors.append(move.last_position_error)
                         execution_rotation_errors.append(move.last_rotation_error_deg)
                         execution_attempts.append(move.last_attempts)
+                        gripper_probabilities.append(
+                            move.last_gripper_probability
+                        )
+                        gripper_changes += int(
+                            move.last_gripper_change_executed
+                        )
+                        suppressed_gripper_changes += int(
+                            move.last_gripper_change_suppressed
+                        )
+                        if move.last_gripper_change_suppressed:
+                            print(
+                                task_str,
+                                "gripper change suppressed",
+                                f"step={step_id}",
+                                f"p_open={move.last_gripper_probability:.3f}",
+                                "pose_error="
+                                f"{1e3 * move.last_position_error:.1f}mm/"
+                                f"{move.last_rotation_error_deg:.1f}deg",
+                            )
 
                     max_reward = max(max_reward, reward)
 
@@ -393,6 +498,15 @@ class RLBenchEnv:
                     f"{np.mean(execution_attempts):.2f}"
                     if execution_attempts else "n/a"
                 ),
+                "GripperP(min/mean/max)",
+                (
+                    f"{np.min(gripper_probabilities):.3f}/"
+                    f"{np.mean(gripper_probabilities):.3f}/"
+                    f"{np.max(gripper_probabilities):.3f}"
+                    if gripper_probabilities else "n/a"
+                ),
+                "GripperChanges/Suppressed",
+                f"{gripper_changes}/{suppressed_gripper_changes}",
             )
 
         # Compensate for failed demos

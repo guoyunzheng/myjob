@@ -139,6 +139,9 @@ class BaseTrainTester:
                 ivc_loss_weight=self.args.ivc_loss_weight,
                 condition_dropout_prob=self.args.condition_dropout_prob,
                 gripper_transition_weight=self.args.gripper_transition_weight,
+                gripper_closed_hold_weight=self.args.gripper_closed_hold_weight,
+                gripper_prediction_mode=self.args.gripper_prediction_mode,
+                gripper_hold_prior_logit=self.args.gripper_hold_prior_logit,
             )
         _model = self.model_cls(**model_kwargs)
 
@@ -410,7 +413,16 @@ class BaseTrainTester:
                         sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
                     )
 
-                losses, losses_B = compute_metrics(pred_action, gt_action)
+                current_openess = sample["proprioception"].cuda(
+                    non_blocking=True
+                )[:, -1:, :, -1:]
+                if pred_action.ndim == 3:
+                    current_openess = current_openess[:, :, 0]
+                losses, losses_B = compute_metrics(
+                    pred_action,
+                    gt_action,
+                    current_openess=current_openess,
+                )
 
                 # Gather global statistics
                 for n, l in losses.items():
@@ -503,6 +515,8 @@ class BaseTrainTester:
             "encoder.proprio_state_encoder.",
             "condition_pooler.relevance_score.",
             "condition_pooler.spatial_moment_projection.",
+            "condition_pooler.secondary_relevance_score.",
+            "condition_pooler.secondary_slot_projection.",
         )
         load_model_state_strict(
             model,
