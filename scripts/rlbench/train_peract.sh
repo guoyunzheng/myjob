@@ -68,7 +68,7 @@ rotation_format=quat_xyzw
 denoise_timesteps=2
 denoise_model=meanflow
 
-run_log_dir=$model_type-$dataset-film_tcn_exact_jvp_v4_gripdirect-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-S$denoise_timesteps-jvp$jvp_microbatch_size-ema$use_ema
+run_log_dir=$model_type-$dataset-film_tcn_exact_jvp_v5_gripsequence-C$C-B$B-lr$lr-$lr_scheduler-H$num_history-$denoise_model-S$denoise_timesteps-jvp$jvp_microbatch_size-ema$use_ema
 checkpoint=train_logs/${main_dir}/${run_log_dir}/last.pth
 
 # 开启可扩展段以减少显存碎片

@@ -30,7 +30,7 @@ headless=True
 collision_checking=False #可能的问题。
 gripper_open_threshold=0.75
 gripper_close_threshold=0.25
-require_pose_for_gripper_change=True
+require_pose_for_gripper_open=True
 seed=0
 
 # Dataset arguments
@@ -71,7 +71,7 @@ for ((i=0; i<$num_ckpts; i++)); do
         --collision_checking $collision_checking \
         --gripper_open_threshold $gripper_open_threshold \
         --gripper_close_threshold $gripper_close_threshold \
-        --require_pose_for_gripper_change $require_pose_for_gripper_change \
+        --require_pose_for_gripper_open $require_pose_for_gripper_open \
         --seed $seed \
         --data_dir $data_dir \
         --dataset $dataset \

@@ -22,6 +22,7 @@ from modeling.encoder.text import fetch_tokenizers
 from online_evaluation_rlbench.get_stored_demos import get_stored_demos
 from online_evaluation_rlbench.gripper_control import (
     hysteresis_gripper_command,
+    should_execute_gripper_change,
 )
 
 
@@ -45,7 +46,7 @@ class Mover:
         initial_action=None,
         gripper_close_threshold=0.25,
         gripper_open_threshold=0.75,
-        require_pose_for_gripper_change=True,
+        require_pose_for_gripper_open=True,
     ):
         self._task = task
         self._last_action = (
@@ -54,8 +55,8 @@ class Mover:
         self._max_tries = max_tries
         self._gripper_close_threshold = gripper_close_threshold
         self._gripper_open_threshold = gripper_open_threshold
-        self._require_pose_for_gripper_change = (
-            require_pose_for_gripper_change
+        self._require_pose_for_gripper_open = (
+            require_pose_for_gripper_open
         )
         self.last_position_error = float("nan")
         self.last_rotation_error_deg = float("nan")
@@ -133,12 +134,13 @@ class Mover:
                 self.last_pose_reached = all(criteria)
                 break
 
-        # Execute a state change only after reaching the requested pose. A
-        # failed planner attempt must never turn a slightly wrong prediction
-        # into an irreversible object release.
-        allow_gripper_change = (
-            self.last_pose_reached
-            or not self._require_pose_for_gripper_change
+        # Delay only closed->open until the requested pose is reached. Closing
+        # must remain available for grasping even if the pose tolerance misses.
+        allow_gripper_change = should_execute_gripper_change(
+            current_gripper,
+            target_gripper,
+            self.last_pose_reached,
+            require_pose_for_opening=self._require_pose_for_gripper_open,
         )
         if (
             reward != 1.0
@@ -215,7 +217,7 @@ class RLBenchEnv:
         collision_checking=False,
         gripper_close_threshold=0.25,
         gripper_open_threshold=0.75,
-        require_pose_for_gripper_change=True,
+        require_pose_for_gripper_open=True,
     ):
 
         # setup required inputs
@@ -232,7 +234,7 @@ class RLBenchEnv:
             )
         self.gripper_close_threshold = gripper_close_threshold
         self.gripper_open_threshold = gripper_open_threshold
-        self.require_pose_for_gripper_change = require_pose_for_gripper_change
+        self.require_pose_for_gripper_open = require_pose_for_gripper_open
 
         # setup RLBench environments
         self.obs_config = self.create_obs_config(
@@ -389,8 +391,8 @@ class RLBenchEnv:
                 initial_action=initial_action,
                 gripper_close_threshold=self.gripper_close_threshold,
                 gripper_open_threshold=self.gripper_open_threshold,
-                require_pose_for_gripper_change=(
-                    self.require_pose_for_gripper_change
+                require_pose_for_gripper_open=(
+                    self.require_pose_for_gripper_open
                 ),
             )
             max_reward = 0.0

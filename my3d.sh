@@ -69,7 +69,7 @@ headless=False
 collision_checking=${COLLISION_CHECKING:-False}
 gripper_open_threshold=${GRIPPER_OPEN_THRESHOLD:-0.75}
 gripper_close_threshold=${GRIPPER_CLOSE_THRESHOLD:-0.25}
-require_pose_for_gripper_change=${REQUIRE_POSE_FOR_GRIPPER_CHANGE:-True}
+require_pose_for_gripper_open=${REQUIRE_POSE_FOR_GRIPPER_OPEN:-True}
 seed=0
 
 # Dataset arguments
@@ -98,7 +98,7 @@ relative_action=false
 rotation_format=quat_xyzw
 denoise_timesteps=${DENOISE_TIMESTEPS:-2}
 denoise_model=meanflow
-checkpoint_alias=${CHECKPOINT_ALIAS:-my_awesome_peract_model-s${denoise_timesteps}-g${guidance_scale}-grip${gripper_close_threshold}-${gripper_open_threshold}-pose${require_pose_for_gripper_change}}
+checkpoint_alias=${CHECKPOINT_ALIAS:-my_awesome_peract_model-s${denoise_timesteps}-g${guidance_scale}-grip${gripper_close_threshold}-${gripper_open_threshold}-openpose${require_pose_for_gripper_open}}
 
 num_ckpts=${#tasks[@]}
 for ((i=0; i<$num_ckpts; i++)); do
@@ -111,7 +111,7 @@ for ((i=0; i<$num_ckpts; i++)); do
         --collision_checking $collision_checking \
         --gripper_open_threshold $gripper_open_threshold \
         --gripper_close_threshold $gripper_close_threshold \
-        --require_pose_for_gripper_change $require_pose_for_gripper_change \
+        --require_pose_for_gripper_open $require_pose_for_gripper_open \
         --seed $seed \
         --data_dir $data_dir \
         --dataset $dataset \

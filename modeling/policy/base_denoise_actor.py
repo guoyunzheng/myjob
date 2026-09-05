@@ -119,13 +119,14 @@ class DenoiseActor(nn.Module):
         self.nrm_dim = int(self.workspace_normalizer.size(-1))
 
     def encode_inputs(self, rgb3d, rgb2d, pcd, instruction, proprio):
+        instr_padding_mask = self.encoder.instruction_padding_mask(instruction)
         fixed_inputs = self.encoder(
             rgb3d, rgb2d, pcd, instruction,
             proprio.flatten(1, 2)
         )
         # Query trajectory (for relative trajectory prediction)
         query_trajectory = proprio[:, -1:]
-        return (query_trajectory,) + fixed_inputs
+        return (query_trajectory,) + fixed_inputs + (instr_padding_mask,)
 
     def encode_condition(self, fixed_inputs):
         """Pool observation tokens once, outside the action-head JVP path."""
@@ -135,7 +136,8 @@ class DenoiseActor(nn.Module):
             rgb2d_feats, rgb2d_pos,
             instr_feats, instr_pos,
             proprio_feats,
-            fps_scene_feats, fps_scene_pos
+            fps_scene_feats, fps_scene_pos,
+            instr_padding_mask,
         ) = fixed_inputs
 
         return self.condition_pooler(
@@ -144,6 +146,7 @@ class DenoiseActor(nn.Module):
             rgb2d_feats=rgb2d_feats,
             rgb2d_pos=rgb2d_pos,
             instr_feats=instr_feats,
+            instr_padding_mask=instr_padding_mask,
             proprio_feats=proprio_feats,
             fps_scene_feats=fps_scene_feats,
             fps_scene_pos=fps_scene_pos,
@@ -174,16 +177,14 @@ class DenoiseActor(nn.Module):
             raise RuntimeError(
                 "Direct gripper prediction requested in legacy_denoise mode."
             )
-        # current_openess is (B, nhand, 1). The target data currently contains
-        # one keypose; expanding keeps the public trajectory shape general.
         with torch.autocast(
             device_type=condition.device.type,
             enabled=False,
         ):
             logits = self.gripper_state_head(
-                condition.float(), current_openess.float()
+                condition.float(), current_openess.float(), traj_len=traj_len
             )
-        return logits.unsqueeze(1).expand(-1, traj_len, -1, -1)
+        return logits
 
     def compute_gripper_loss(self, logits, target_openess, current_openess):
         """Cost-sensitive BCE that protects a closed gripper during transport."""
@@ -705,17 +706,36 @@ class ConditionPooler(nn.Module):
             nn.LayerNorm(condition_dim),
         )
 
-    def _pool_tokens(self, tokens, positions, reference):
+    def _pool_tokens(
+        self, tokens, positions, reference, padding_mask=None
+    ):
         if tokens is None or tokens.shape[1] == 0:
             return reference.new_zeros(
                 reference.shape[0], 2 * self.embedding_dim
             )
+
+        if padding_mask is not None:
+            if padding_mask.shape != tokens.shape[:2]:
+                raise ValueError(
+                    "padding_mask must match the first two token dimensions; "
+                    f"got {tuple(padding_mask.shape)} for "
+                    f"{tuple(tokens.shape)}."
+                )
+            padding_mask = padding_mask.to(
+                device=tokens.device, dtype=torch.bool
+            )
+            # CLIP always starts with a valid BOS token. Keeping it unmasked
+            # also guarantees finite softmax/max output for malformed input.
+            padding_mask = padding_mask.clone()
+            padding_mask[:, 0] = False
 
         if positions is not None:
             position_features = self.position_projection(positions)
             tokens = tokens + position_features.to(dtype=tokens.dtype)
         tokens = self.token_norm(tokens)
         scores = self.relevance_score(tokens).squeeze(-1)
+        if padding_mask is not None:
+            scores = scores.masked_fill(padding_mask, -torch.inf)
         weights_float = scores.float().softmax(dim=1)
         weights = weights_float.to(dtype=tokens.dtype)
         relevant = (tokens * weights.unsqueeze(-1)).sum(dim=1)
@@ -735,6 +755,10 @@ class ConditionPooler(nn.Module):
                 spatial_moments
             ).to(dtype=relevant.dtype)
         secondary_scores = self.secondary_relevance_score(tokens)
+        if padding_mask is not None:
+            secondary_scores = secondary_scores.masked_fill(
+                padding_mask.unsqueeze(-1), -torch.inf
+            )
         secondary_weights_float = secondary_scores.float().softmax(dim=1)
         secondary_weights = secondary_weights_float.to(dtype=tokens.dtype)
         secondary_features = torch.einsum(
@@ -771,9 +795,14 @@ class ConditionPooler(nn.Module):
         relevant = relevant + self.secondary_slot_projection(
             secondary_summary.float()
         ).to(dtype=relevant.dtype)
-        return torch.cat(
-            (relevant, tokens.amax(dim=1)), dim=-1
-        )
+        if padding_mask is not None:
+            max_tokens = tokens.masked_fill(
+                padding_mask.unsqueeze(-1),
+                torch.finfo(tokens.dtype).min,
+            ).amax(dim=1)
+        else:
+            max_tokens = tokens.amax(dim=1)
+        return torch.cat((relevant, max_tokens), dim=-1)
 
     def forward(
         self,
@@ -785,6 +814,7 @@ class ConditionPooler(nn.Module):
         proprio_feats,
         fps_scene_feats,
         fps_scene_pos,
+        instr_padding_mask=None,
     ):
         reference = rgb3d_feats
         pooled_features = [
@@ -793,7 +823,12 @@ class ConditionPooler(nn.Module):
                 fps_scene_feats, fps_scene_pos, reference
             ),
             self._pool_tokens(rgb2d_feats, rgb2d_pos, reference),
-            self._pool_tokens(instr_feats, None, reference),
+            self._pool_tokens(
+                instr_feats,
+                None,
+                reference,
+                padding_mask=instr_padding_mask,
+            ),
             self._pool_tokens(proprio_feats, None, reference),
         ]
         return self.output_projection(torch.cat(pooled_features, dim=-1))

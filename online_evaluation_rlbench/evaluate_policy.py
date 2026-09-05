@@ -28,7 +28,7 @@ def parse_arguments():
         ('collision_checking', str2bool, False),
         ('gripper_open_threshold', float, 0.75),
         ('gripper_close_threshold', float, 0.25),
-        ('require_pose_for_gripper_change', str2bool, True),
+        ('require_pose_for_gripper_open', str2bool, True),
         ('seed', int, 0),
         # Dataset arguments
         ('data_dir', Path, Path(__file__).parent / "demos"),
@@ -214,8 +214,8 @@ if __name__ == "__main__":
             env_kwargs.update(
                 gripper_open_threshold=args.gripper_open_threshold,
                 gripper_close_threshold=args.gripper_close_threshold,
-                require_pose_for_gripper_change=(
-                    args.require_pose_for_gripper_change
+                require_pose_for_gripper_open=(
+                    args.require_pose_for_gripper_open
                 ),
             )
         env = RLBenchEnv(**env_kwargs)

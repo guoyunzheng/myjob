@@ -26,3 +26,20 @@ def hysteresis_gripper_command(
     if state == 1.0 and probability <= close_threshold:
         return 0.0
     return state
+
+
+def should_execute_gripper_change(
+    current_state,
+    target_state,
+    pose_reached,
+    require_pose_for_opening=True,
+):
+    """Gate irreversible opening without suppressing a requested grasp."""
+    current = 1.0 if float(current_state) >= 0.5 else 0.0
+    target = 1.0 if float(target_state) >= 0.5 else 0.0
+    if current == target:
+        return False
+    opening = current == 0.0 and target == 1.0
+    if opening and require_pose_for_opening:
+        return bool(pose_reached)
+    return True
