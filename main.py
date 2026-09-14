@@ -35,6 +35,10 @@ def parse_arguments():
         # Training and testing arguments
         ('checkpoint', str_none, None),
         ('val_freq', int, 4000),
+        ('diagnostic_interval', int, 100),
+        ('val_batches', int, -1),  # -1 validates the complete validation set
+        ('validation_noise_repeats', int, 3),
+        ('validation_probe_batches', int, 4),
         ('interm_ckpt_freq', int, 1000000),
         ('eval_only', str2bool, False),
         ('lr', float, 1e-4),
@@ -83,7 +87,16 @@ def parse_arguments():
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.diagnostic_interval < 1 or args.validation_noise_repeats < 1:
+        parser.error(
+            'diagnostic_interval and validation_noise_repeats must be positive'
+        )
+    if args.validation_probe_batches < 0:
+        parser.error('validation_probe_batches must be non-negative')
+    if args.val_batches != -1 and args.val_batches < 1:
+        parser.error('val_batches must be -1 or positive')
+    return args
 
 
 def suppress_output_on_non_main():

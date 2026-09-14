@@ -4,7 +4,6 @@ from torch.nn import functional as F
 import einops
 from torch.func import jvp
 from ..noise_scheduler import fetch_schedulers
-from ..utils.layers import AttentionModule
 from ..utils.position_encodings import SinusoidalPosEmb
 from .gripper_head import GripperStateHead
 from ..utils.utils import (
@@ -67,6 +66,8 @@ class DenoiseActor(nn.Module):
         self._gripper_transition_weight = gripper_transition_weight
         self._gripper_closed_hold_weight = gripper_closed_hold_weight
         self._gripper_prediction_mode = gripper_prediction_mode
+        self.collect_training_diagnostics = False
+        self.loss_diagnostics = {}
 
         # Vision-language encoder, runs only once
         self.encoder = None  # Implement this!
@@ -206,12 +207,35 @@ class DenoiseActor(nn.Module):
         )
         return (elementwise_loss * weights).sum() / weights.sum().clamp_min(1.0)
 
-    def conditional_sample(self, trajectory, device, fixed_inputs, guidance_scale=1.0, uncond_inputs=None):
-        self.position_scheduler.set_timesteps(self.n_steps, device=device)
-        self.rotation_scheduler.set_timesteps(self.n_steps, device=device)
+    def denoise_trajectory(
+        self, trajectory, condition, guidance_scale=1.0, uncond_condition=None
+    ):
+        """Shared differentiable solver for inference and endpoint supervision."""
+        self.position_scheduler.set_timesteps(self.n_steps, device=trajectory.device)
+        self.rotation_scheduler.set_timesteps(self.n_steps, device=trajectory.device)
+        for t, r in zip(
+            self.position_scheduler.timesteps,
+            self.position_scheduler.prev_timesteps,
+        ):
+            batch_r, batch_t = r.expand(len(trajectory)), t.expand(len(trajectory))
+            out = self.policy_forward_pass(
+                trajectory, batch_r, batch_t, condition
+            )[-1]
+            if guidance_scale != 1.0:
+                out_uncond = self.policy_forward_pass(
+                    trajectory, batch_r, batch_t, uncond_condition
+                )[-1]
+                out = out_uncond + guidance_scale * (out - out_uncond)
+            pos = self.position_scheduler.step(
+                out[..., :3], t, r, trajectory[..., :3]
+            ).prev_sample
+            rot = self.rotation_scheduler.step(
+                out[..., 3:-1], t, r, trajectory[..., 3:]
+            ).prev_sample
+            trajectory = torch.cat((pos, rot), dim=-1)
+        return trajectory, out
 
-        timesteps = self.position_scheduler.timesteps
-        prev_timesteps = self.position_scheduler.prev_timesteps
+    def conditional_sample(self, trajectory, device, fixed_inputs, guidance_scale=1.0, uncond_inputs=None):
         condition = self.encode_condition(fixed_inputs)
 
         uncond_condition = None
@@ -229,38 +253,9 @@ class DenoiseActor(nn.Module):
                 else self.encode_condition(uncond_fixed_inputs)
             )
 
-        for idx, t in enumerate(timesteps):
-            # 条件分支
-            r = prev_timesteps[idx]
-            out_cond = self.policy_forward_pass(
-                trajectory,
-                r * torch.ones(len(trajectory), device=device),
-                t * torch.ones(len(trajectory), device=device),
-                condition,
-            )
-            out_cond = out_cond[-1]
-
-            if guidance_scale == 1.0:
-                out = out_cond
-            else:
-                out_uncond = self.policy_forward_pass(
-                    trajectory,
-                    r * torch.ones(len(trajectory), device=device),
-                    t * torch.ones(len(trajectory), device=device),
-                    uncond_condition,
-                )
-                out_uncond = out_uncond[-1]
-                out = out_uncond + guidance_scale * (out_cond - out_uncond)
-
-            pos = self.position_scheduler.step(
-                out[..., :3],
-                t, r, trajectory[..., :3]
-            ).prev_sample
-            rot = self.rotation_scheduler.step(
-                out[..., 3:-1],
-                t, r, trajectory[..., 3:]
-            ).prev_sample
-            trajectory = torch.cat((pos, rot), -1)
+        trajectory, out = self.denoise_trajectory(
+            trajectory, condition, guidance_scale, uncond_condition
+        )
 
         if self._gripper_prediction_mode == "direct":
             current_openess = fixed_inputs[0][:, -1, :, -1:]
@@ -290,15 +285,18 @@ class DenoiseActor(nn.Module):
         # The normalizer bounds already include a workspace safety buffer.
         # Prevent denoising overshoot from producing unreachable world poses.
         trajectory[..., :3] = trajectory[..., :3].clamp(-1.0, 1.0)
-        _, traj_len, nhand, _ = trajectory.shape
-        trajectory = self.unconvert_rot(
-            trajectory.flatten(1, 2)
-        ).unflatten(1, (traj_len, nhand))
+        trajectory = self.unconvert_rot(trajectory)
         trajectory = self.unnormalize_pos(trajectory)
         trajectory[..., -1] = trajectory[..., -1].sigmoid()
         return trajectory
 
     def compute_loss(self, gt_trajectory, rgb3d, rgb2d, pcd, instruction, proprio):
+        diagnostics = {} if self.collect_training_diagnostics else None
+
+        def record(name, value):
+            if diagnostics is not None:
+                diagnostics[name] = diagnostics.get(name, 0) + value.detach()
+
         fixed_inputs = self.encode_inputs(
             rgb3d, rgb2d, pcd, instruction, proprio
         )
@@ -320,10 +318,8 @@ class DenoiseActor(nn.Module):
         gt_position_world = gt_trajectory[..., :3].float()
         current_openess = proprio[:, -1:, :, -1:].float()
         gt_trajectory = self.normalize_pos(gt_trajectory[..., :-1])
-        _, traj_len, nhand, _ = gt_trajectory.shape
-        gt_trajectory = self.convert_rot(
-            gt_trajectory.flatten(1, 2)
-        ).unflatten(1, (traj_len, nhand))
+        traj_len = gt_trajectory.shape[1]
+        gt_trajectory = self.convert_rot(gt_trajectory)
 
         direct_gripper_loss = None
         if self._gripper_prediction_mode == "direct":
@@ -363,7 +359,11 @@ class DenoiseActor(nn.Module):
             prediction = self.policy_forward_pass(
                 noisy_trajectory, r, t, condition
             )
-            ivc_mask = torch.isclose(r, t)
+            loss_ivc = self.compute_ivc_loss(
+                noisy_trajectory, r, t, velocity, condition
+            )
+            total_loss = total_loss + self._ivc_loss_weight * loss_ivc
+            record('ivc', self._ivc_loss_weight * loss_ivc)
 
             for layer_prediction in prediction:
                 u_prediction = layer_prediction[..., :-1].float()
@@ -385,84 +385,88 @@ class DenoiseActor(nn.Module):
                     )
                 else:
                     loss_openess = layer_prediction.new_zeros(())
-                ivc_per_sample = (
-                    u_prediction - velocity.float()
-                ).square().flatten(1).mean(1)
-                ivc_weights = ivc_mask.to(dtype=ivc_per_sample.dtype)
-                loss_ivc = (
-                    ivc_per_sample * ivc_weights
-                ).sum() / ivc_weights.sum().clamp_min(1)
 
-                # Supervise the exact multi-step solver used at evaluation.
-                # The previous one-step endpoint objective did not match a
-                # two- or five-step rollout and could improve its own loss
-                # while the executed endpoint remained imprecise.
-                self.position_scheduler.set_timesteps(
-                    self.n_steps, device=noise.device
-                )
-                endpoint_reconstruction = noise.float()
-                for endpoint_t, endpoint_r in zip(
-                    self.position_scheduler.timesteps,
-                    self.position_scheduler.prev_timesteps,
-                ):
-                    endpoint_prediction = self.policy_forward_pass(
-                        endpoint_reconstruction,
-                        endpoint_r.expand(len(noise)),
-                        endpoint_t.expand(len(noise)),
-                        condition,
-                    )[-1][..., :-1].float()
-                    endpoint_pos = self.position_scheduler.step(
-                        endpoint_prediction[..., :3],
-                        endpoint_t,
-                        endpoint_r,
-                        endpoint_reconstruction[..., :3],
-                    ).prev_sample
-                    endpoint_rot = self.rotation_scheduler.step(
-                        endpoint_prediction[..., 3:],
-                        endpoint_t,
-                        endpoint_r,
-                        endpoint_reconstruction[..., 3:],
-                    ).prev_sample
-                    endpoint_reconstruction = torch.cat(
-                        (endpoint_pos, endpoint_rot), dim=-1
-                    )
-                endpoint_position_world = self.unnormalize_pos(
-                    endpoint_reconstruction
-                )[..., :3]
-                loss_endpoint_position = 30 * F.smooth_l1_loss(
-                    endpoint_position_world,
-                    gt_position_world,
-                    beta=0.005,
-                )
-                pred_rotation = compute_rotation_matrix_from_ortho6d(
-                    endpoint_reconstruction[..., 3:].reshape(-1, 6)
-                )
-                gt_rotation = compute_rotation_matrix_from_ortho6d(
-                    gt_trajectory[..., 3:].float().reshape(-1, 6)
-                )
-                rotation_cosine = (
-                    (pred_rotation * gt_rotation).sum(dim=(-1, -2)) - 1.0
-                ) * 0.5
-                # 1-cos(theta) is a stable SO(3) endpoint objective whose scale
-                # reflects physical angular error rather than raw 6D distance.
-                loss_endpoint_rotation = 10 * (
-                    1.0 - rotation_cosine.clamp(-1.0, 1.0)
-                ).mean()
                 total_loss = (
                     total_loss
                     + loss_position
                     + loss_rotation
                     + loss_openess
-                    + self._ivc_loss_weight * loss_ivc
-                    + self._endpoint_loss_weight * (
-                        loss_endpoint_position + loss_endpoint_rotation
-                    )
                 )
+                record('velocity_position', loss_position)
+                record('velocity_rotation', loss_rotation)
+                record('gripper', loss_openess)
+
+            if self._endpoint_loss_weight != 0:
+                endpoint_loss = self.compute_endpoint_loss(
+                    noise, condition, gt_position_world, gt_trajectory
+                )
+                total_loss = total_loss + (
+                    len(prediction) * self._endpoint_loss_weight * endpoint_loss
+                )
+                if diagnostics is not None:
+                    for name, value in self.endpoint_loss_diagnostics.items():
+                        record(
+                            name,
+                            len(prediction) * self._endpoint_loss_weight * value,
+                        )
 
         total_loss = total_loss / self._lv2_batch_size
         if direct_gripper_loss is not None:
             total_loss = total_loss + direct_gripper_loss
+        if diagnostics is not None:
+            self.loss_diagnostics = {
+                name: value / self._lv2_batch_size for name, value in diagnostics.items()
+            }
+            if direct_gripper_loss is not None:
+                self.loss_diagnostics['gripper'] = direct_gripper_loss.detach()
         return total_loss
+
+    def compute_endpoint_loss(self, noise, condition, gt_position_world, gt_trajectory):
+        """Supervise the same multi-step rollout executed at evaluation."""
+        reconstruction, _ = self.denoise_trajectory(noise.float(), condition)
+        position_loss = 30 * F.smooth_l1_loss(
+            self.unnormalize_pos(reconstruction)[..., :3],
+            gt_position_world,
+            beta=0.005,
+        )
+        pred_rotation = compute_rotation_matrix_from_ortho6d(
+            reconstruction[..., 3:].reshape(-1, 6)
+        )
+        gt_rotation = compute_rotation_matrix_from_ortho6d(
+            gt_trajectory[..., 3:].float().reshape(-1, 6)
+        )
+        rotation_cosine = (
+            (pred_rotation * gt_rotation).sum(dim=(-1, -2)) - 1.0
+        ) * 0.5
+        rotation_loss = 10 * (1.0 - rotation_cosine.clamp(-1.0, 1.0)).mean()
+        if self.collect_training_diagnostics:
+            self.endpoint_loss_diagnostics = {
+                'endpoint_position': position_loss.detach(),
+                'endpoint_rotation': rotation_loss.detach(),
+            }
+        return position_loss + rotation_loss
+
+    def compute_ivc_loss(self, z, r, t, velocity, condition):
+        """Supervise u(z_t, t, t) only for samples drawn with r != t.
+
+        Diagonal samples already receive velocity supervision from the main
+        MeanFlow loss (with L1 rather than this auxiliary MSE). For off-diagonal
+        samples, evaluate a separate diagonal prediction: u(z_t, r, t) is an
+        average velocity and must retain its MeanFlow target. Keep gradients
+        through the selected condition features as well as the action head.
+        """
+        if self._ivc_loss_weight == 0:
+            return z.new_zeros((), dtype=torch.float32)
+        # The sampler sets r=t exactly. Preserve even very short nonzero
+        # intervals instead of discarding them using an isclose tolerance.
+        mask = r != t
+        if not mask.any():
+            return z.new_zeros((), dtype=torch.float32)
+        diagonal_t = t[mask]
+        diagonal_prediction = self.policy_forward_pass(
+            z[mask], diagonal_t, diagonal_t, condition[mask]
+        )[-1][..., :-1].float()
+        return F.mse_loss(diagonal_prediction, velocity[mask].float())
 
     def compute_meanflow_target(self, z, r, t, velocity, condition):
         """Construct the stop-gradient target using the exact MeanFlow JVP.
@@ -546,49 +550,24 @@ class DenoiseActor(nn.Module):
             return signal
         # Else assume quaternion
         rot = normalise_quat(signal[..., 3:7])
-        res = signal[..., 7:] if signal.size(-1) > 7 else None
         # The following code expects wxyz quaternion format!
         if self._rotation_format == 'quat_xyzw':
             rot = rot[..., (3, 0, 1, 2)]
-        # Convert to rotation matrix
-        rot = quaternion_to_matrix(rot)
-        # Convert to 6D
-        if len(rot.shape) == 4:
-            B, L, D1, D2 = rot.shape
-            rot = rot.reshape(B * L, D1, D2)
-            rot = get_ortho6d_from_rotation_matrix(rot)
-            rot = rot.reshape(B, L, 6)
-        else:
-            rot = get_ortho6d_from_rotation_matrix(rot)
-        # Concatenate pos, rot, other state info
-        signal = torch.cat([signal[..., :3], rot], dim=-1)
-        if res is not None:
-            signal = torch.cat((signal, res), -1)
-        return signal
+        matrix = quaternion_to_matrix(rot)
+        rot = get_ortho6d_from_rotation_matrix(matrix.reshape(-1, 3, 3))
+        rot = rot.reshape(*signal.shape[:-1], 6)
+        return torch.cat((signal[..., :3], rot, signal[..., 7:]), dim=-1)
 
     def unconvert_rot(self, signal):
-        # If Euler then no conversion
         if self._rotation_format == 'euler':
             return signal
-        # Else assume quaternion
-        res = signal[..., 9:] if signal.size(-1) > 9 else None
-        if len(signal.shape) == 3:
-            B, L, _ = signal.shape
-            rot = signal[..., 3:9].reshape(B * L, 6)
-            mat = compute_rotation_matrix_from_ortho6d(rot)
-            quat = matrix_to_quaternion(mat)
-            quat = quat.reshape(B, L, 4)
-        else:
-            rot = signal[..., 3:9]
-            mat = compute_rotation_matrix_from_ortho6d(rot)
-            quat = matrix_to_quaternion(mat)
-        # The above code handled wxyz quaternion format!
+        matrix = compute_rotation_matrix_from_ortho6d(
+            signal[..., 3:9].reshape(-1, 6)
+        )
+        quat = matrix_to_quaternion(matrix).reshape(*signal.shape[:-1], 4)
         if self._rotation_format == 'quat_xyzw':
             quat = quat[..., (1, 2, 3, 0)]
-        signal = torch.cat([signal[..., :3], quat], dim=-1)
-        if res is not None:
-            signal = torch.cat((signal, res), -1)
-        return signal
+        return torch.cat((signal[..., :3], quat, signal[..., 9:]), dim=-1)
 
     def forward(
         self,
@@ -706,6 +685,23 @@ class ConditionPooler(nn.Module):
             nn.LayerNorm(condition_dim),
         )
 
+    @staticmethod
+    def _spatial_moments(positions, weights):
+        """Centroid and spread for relevance weights shaped (B, N, S)."""
+        positions = positions.float()
+        # Preserve the primary slot's FP32 reductions under encoder autocast.
+        # Secondary slots retain their existing batched einsum precision.
+        if weights.shape[-1] == 1:
+            centroid = (positions * weights).sum(dim=1).unsqueeze(1)
+        else:
+            centroid = torch.einsum("bns,bnd->bsd", weights, positions)
+        centered = positions.unsqueeze(2) - centroid.unsqueeze(1)
+        if weights.shape[-1] == 1:
+            variance = (centered.square() * weights.unsqueeze(-1)).sum(dim=1)
+        else:
+            variance = torch.einsum("bns,bnsd->bsd", weights, centered.square())
+        return torch.cat((centroid, variance.clamp_min(1e-8).sqrt()), dim=-1)
+
     def _pool_tokens(
         self, tokens, positions, reference, padding_mask=None
     ):
@@ -740,17 +736,9 @@ class ConditionPooler(nn.Module):
         weights = weights_float.to(dtype=tokens.dtype)
         relevant = (tokens * weights.unsqueeze(-1)).sum(dim=1)
         if positions is not None:
-            positions_float = positions.float()
-            centroid = (
-                positions_float * weights_float.unsqueeze(-1)
-            ).sum(dim=1)
-            centered = positions_float - centroid.unsqueeze(1)
-            spread = torch.sqrt(
-                (
-                    centered.square() * weights_float.unsqueeze(-1)
-                ).sum(dim=1).clamp_min(1e-8)
-            )
-            spatial_moments = torch.cat((centroid, spread), dim=-1)
+            spatial_moments = self._spatial_moments(
+                positions, weights_float.unsqueeze(-1)
+            ).squeeze(1)
             relevant = relevant + self.spatial_moment_projection(
                 spatial_moments
             ).to(dtype=relevant.dtype)
@@ -765,23 +753,8 @@ class ConditionPooler(nn.Module):
             "bns,bne->bse", secondary_weights, tokens
         )
         if positions is not None:
-            positions_float = positions.float()
-            secondary_centroids = torch.einsum(
-                "bns,bnd->bsd", secondary_weights_float, positions_float
-            )
-            secondary_centered = (
-                positions_float.unsqueeze(2)
-                - secondary_centroids.unsqueeze(1)
-            )
-            secondary_spreads = torch.sqrt(
-                torch.einsum(
-                    "bns,bnsd->bsd",
-                    secondary_weights_float,
-                    secondary_centered.square(),
-                ).clamp_min(1e-8)
-            )
-            secondary_moments = torch.cat(
-                (secondary_centroids, secondary_spreads), dim=-1
+            secondary_moments = self._spatial_moments(
+                positions, secondary_weights_float
             ).to(dtype=secondary_features.dtype)
         else:
             secondary_moments = secondary_features.new_zeros(
@@ -988,274 +961,3 @@ class FiLMTemporalConvHead(nn.Module):
             h=nhand,
         )
         return [output]
-
-
-class TransformerHead(nn.Module):
-
-    def __init__(self,
-                 embedding_dim=128,
-                 num_attn_heads=8,
-                 num_shared_attn_layers=4,
-                 nhist=3,
-                 rotary_pe=True,
-                 rot_dim=6):
-        super().__init__()
-
-        # Different embeddings
-        self.time_emb = nn.Sequential(
-            SinusoidalPosEmb(embedding_dim),
-            nn.Linear(embedding_dim, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, embedding_dim)
-        )
-        self.curr_gripper_emb = nn.Sequential(
-            nn.Linear(embedding_dim * nhist, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, embedding_dim)
-        )
-        self.traj_time_emb = SinusoidalPosEmb(embedding_dim)
-        self.hand_embed = nn.Embedding(2, embedding_dim)
-
-        # Attention from trajectory queries to language
-
-
-        self.traj_lang_attention = AttentionModule(
-            num_layers=1,
-            d_model=embedding_dim,
-            dim_fw=4 * embedding_dim,
-            dropout=0.1,
-            n_heads=num_attn_heads,
-            pre_norm=False,
-            rotary_pe=False,
-            use_adaln=False,
-            is_self=False
-        )
-
-        self.cross_attn = AttentionModule(
-            num_layers=2,
-            d_model=embedding_dim,
-            dim_fw=embedding_dim,
-            dropout=0.1,
-            n_heads=num_attn_heads,
-            pre_norm=False,
-            rotary_pe=rotary_pe,
-            use_adaln=True,
-            is_self=False
-        )
-
-        # Shared attention layers
-        self.self_attn = AttentionModule(
-            num_layers=num_shared_attn_layers,
-            d_model=embedding_dim,
-            dim_fw=embedding_dim,
-            dropout=0.1,
-            n_heads=num_attn_heads,
-            pre_norm=False,
-            rotary_pe=rotary_pe,
-            use_adaln=True,
-            is_self=True
-        )
-
-        # Specific (non-shared) Output layers:
-        # 1. Rotation
-        self.rotation_proj = nn.Linear(embedding_dim, embedding_dim)
-        self.rotation_self_attn = AttentionModule(
-            num_layers=2,
-            d_model=embedding_dim,
-            dim_fw=embedding_dim,
-            dropout=0.1,
-            n_heads=num_attn_heads,
-            pre_norm=False,
-            rotary_pe=rotary_pe,
-            use_adaln=True,
-            is_self=True
-        )
-        self.rotation_predictor = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, rot_dim)
-        )
-
-        # 2. Position
-        self.position_proj = nn.Linear(embedding_dim, embedding_dim)
-        self.position_self_attn = AttentionModule(
-            num_layers=2,
-            d_model=embedding_dim,
-            dim_fw=embedding_dim,
-            dropout=0.1,
-            n_heads=num_attn_heads,
-            pre_norm=False,
-            rotary_pe=rotary_pe,
-            use_adaln=True,
-            is_self=True
-        )
-        self.position_predictor = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, 3)
-        )
-
-        # 3. Openess
-        self.openess_predictor = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, 1)
-        )
-
-    def forward(self, traj_feats, trajectory, timesteps1,timesteps2,
-                rgb3d_feats, rgb3d_pos, rgb2d_feats, rgb2d_pos,
-                instr_feats, instr_pos, proprio_feats,
-                fps_scene_feats, fps_scene_pos):
-        """
-        Arguments:
-            traj_feats: (B, trajectory_length, nhand, F)
-            trajectory: (B, trajectory_length, nhand, 3+6+X)
-            timesteps: (B, 1)
-            rgb3d_feats: (B, N, F)
-            rgb3d_pos: (B, N, 3)
-            rgb2d_feats: (B, N2d, F)
-            rgb2d_pos: (B, N2d, 3)
-            instr_feats: (B, L, F)
-            instr_pos: (B, L, 3)
-            proprio_feats: (B, nhist*nhand, F)
-            fps_scene_feats: (B, M, F), M < N
-            fps_scene_pos: (B, M, 3)
-
-        Returns:
-            list of (B, trajectory_length, nhand, 3+6+X)
-        """
-        _, traj_len, nhand, _ = trajectory.shape
-
-        # Trajectory features
-        if nhand > 1:
-            traj_feats = traj_feats + self.hand_embed.weight[None, None]
-        traj_feats = einops.rearrange(traj_feats, 'b l h c -> b (l h) c')
-        trajectory = einops.rearrange(trajectory, 'b l h c -> b (l h) c')
-
-        # Trajectory features cross-attend to context features
-        traj_time_pos = self.traj_time_emb(
-            torch.arange(0, traj_len, device=traj_feats.device)
-        )[None, None].repeat(len(traj_feats), 1, nhand, 1)
-        traj_time_pos = einops.rearrange(traj_time_pos, 'b l h c -> b (l h) c')
-
-        traj_feats = self.traj_lang_attention(
-            seq1=traj_feats,
-            seq2=instr_feats,
-            seq1_sem_pos=traj_time_pos, seq2_sem_pos=None
-        )[-1]
-
-        traj_feats = traj_feats + traj_time_pos
-        traj_xyz = trajectory[..., :3]
-
-        # Denoising timesteps' embeddings
-        time_embs = self.encode_denoising_timestep(
-            timesteps1,timesteps2, proprio_feats
-        )
-
-        # Positional embeddings
-        rel_traj_pos, rel_scene_pos, rel_pos = self.get_positional_embeddings(
-            traj_xyz, traj_feats,
-            rgb3d_pos, rgb3d_feats, rgb2d_feats, rgb2d_pos,
-            timesteps1,timesteps2, proprio_feats,
-            fps_scene_feats, fps_scene_pos,
-            instr_feats, instr_pos
-        )
-
-        # Cross attention from gripper to full context
-        traj_feats = self.cross_attn(
-            seq1=traj_feats,
-            seq2=rgb3d_feats,
-            seq1_pos=rel_traj_pos,
-            seq2_pos=rel_scene_pos,
-            ada_sgnl=time_embs
-        )[-1]
-
-        # Self attention among gripper and sampled context
-        features = self.get_sa_feature_sequence(
-            traj_feats, fps_scene_feats,
-            rgb3d_feats, rgb2d_feats, instr_feats
-        )
-        features = self.self_attn(
-            seq1=features,
-            seq2=features,
-            seq1_pos=rel_pos,
-            seq2_pos=rel_pos,
-            ada_sgnl=time_embs
-        )[-1]
-
-        # Rotation head
-        rotation = self.predict_rot(
-            features, rel_pos, time_embs, traj_feats.shape[1]
-        )
-
-        # Position head
-        position, position_features = self.predict_pos(
-            features, rel_pos, time_embs, traj_feats.shape[1]
-        )
-
-        # Openess head from position head
-        openess = self.openess_predictor(position_features)
-
-        return [
-            torch.cat((position, rotation, openess), -1)
-                 .unflatten(1, (traj_len, nhand))
-        ]
-
-    def encode_denoising_timestep(self, timestep1,timestep2 ,proprio_feats):
-        """
-        Compute denoising timestep features and positional embeddings.
-
-        Args:
-            - timestep: (B,)
-
-        Returns:
-            - time_feats: (B, F)
-        """
-        time_feats = self.time_emb(timestep1)
-        time_feats2 = self.time_emb(timestep2)
-        proprio_feats = proprio_feats.flatten(1)
-        curr_gripper_feats = self.curr_gripper_emb(proprio_feats)
-        return 0.5*time_feats + curr_gripper_feats+ 0.5*time_feats2
-    
-
-    def get_positional_embeddings(
-        self,traj_xyz, traj_feats,
-        rgb3d_pos, rgb3d_feats, rgb2d_feats, rgb2d_pos,
-        timesteps1,timesteps2, proprio_feats,
-        fps_scene_feats, fps_scene_pos,
-        instr_feats, instr_pos
-    ):
-        return None, None, None
-
-    def get_sa_feature_sequence(
-        self,
-        traj_feats, fps_scene_feats,
-        rgb3d_feats, rgb2d_feats, instr_feats
-    ):
-        return torch.cat([traj_feats, fps_scene_feats], 1)
-
-    def predict_pos(self, features, pos, time_embs, traj_len):
-        position_features = self.position_self_attn(
-            seq1=features,
-            seq2=features,
-            seq1_pos=pos,
-            seq2_pos=pos,
-            ada_sgnl=time_embs
-        )[-1]
-        position_features = position_features[:, :traj_len]
-        position_features = self.position_proj(position_features)  # (B, N, C)
-        position = self.position_predictor(position_features)
-        return position, position_features
-
-    def predict_rot(self, features, pos, time_embs, traj_len):
-        rotation_features = self.rotation_self_attn(
-            seq1=features,
-            seq2=features,
-            seq1_pos=pos,
-            seq2_pos=pos,
-            ada_sgnl=time_embs
-        )[-1]
-        rotation_features = rotation_features[:, :traj_len]
-        rotation_features = self.rotation_proj(rotation_features)  # (B, N, C)
-        rotation = self.rotation_predictor(rotation_features)
-        return rotation

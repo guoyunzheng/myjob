@@ -20,7 +20,8 @@ from ..data_preprocessors import fetch_data_preprocessor
 from ..ema import EMA
 from ..checkpoint_utils import load_model_state_strict
 from ..schedulers import fetch_scheduler
-from .utils import compute_metrics, compute_task_balanced_selection
+from .utils import compute_task_balanced_selection
+from .validation import ActionValidation, noise_sensitivity
 
 
 class BaseTrainTester:
@@ -41,6 +42,7 @@ class BaseTrainTester:
 
         if dist.get_rank() == 0 and not self.args.eval_only:
             self.writer = SummaryWriter(log_dir=args.log_dir)
+            self.writer.add_text("run/config", str(vars(args)), 0)
 
     def get_datasets(self):
         """Initialize datasets."""
@@ -107,6 +109,25 @@ class BaseTrainTester:
             )
         else:
             val_loader = None
+        self.unique_train_samples = len(train_dataset.annos["action"])
+        self.global_batch_size = self.args.batch_size * dist.get_world_size()
+        if dist.get_rank() == 0:
+            validation_samples = len(val_dataset.annos["action"])
+            print(
+                f"Dataset: {self.unique_train_samples} unique train samples, "
+                f"{validation_samples} validation samples, global batch "
+                f"{self.global_batch_size}."
+            )
+            if not self.args.eval_only:
+                self.writer.add_scalar(
+                    "run/unique_train_samples", self.unique_train_samples, 0
+                )
+                self.writer.add_scalar(
+                    "run/validation_samples", validation_samples, 0
+                )
+                self.writer.add_scalar(
+                    "run/global_batch_size", self.global_batch_size, 0
+                )
         return train_loader, val_loader, train_sampler
 
     def get_model(self):
@@ -316,7 +337,9 @@ class BaseTrainTester:
                 iter_loader = iter(train_loader)
                 sample = next(iter_loader)
 
-            self.train_one_step(model, optimizer, scaler, lr_scheduler, sample)
+            self.train_one_step(
+                model, optimizer, scaler, lr_scheduler, sample, step_id
+            )
             self.ema.step(model, ema_model, self.args.use_ema, step_id)
 
             if (step_id + 1) % self.args.val_freq == 0 and dist.get_rank() == 0:
@@ -332,7 +355,7 @@ class BaseTrainTester:
                 new_loss = self.evaluate_nsteps(
                     ema_model if self.args.use_ema else model,
                     val_loader, step_id,
-                    val_iters=1250
+                    val_iters=self.args.val_batches
                 )
                 # save model
                 best_loss = self.save_checkpoint(
@@ -364,33 +387,96 @@ class BaseTrainTester:
             )
         return out  # loss if training, else action
 
-    def train_one_step(self, model, optimizer, scaler, lr_scheduler, sample):
+    def train_one_step(
+        self, model, optimizer, scaler, lr_scheduler, sample, step_id=0
+    ):
         """Run a single training step."""
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        log_step = (
+            step_id == 0
+            or (step_id + 1) % self.args.diagnostic_interval == 0
+        )
+        actor = model.module if hasattr(model, "module") else model
+        actor.collect_training_diagnostics = log_step and not self.args.use_compile
 
         # Forward pass
         loss = self._model_forward(model, sample)
+        finite = torch.isfinite(loss.detach()).to(dtype=torch.int32)
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+        if not finite.item():
+            raise FloatingPointError(
+                f"Non-finite training loss at step {step_id + 1}."
+            )
 
         # Backward pass
         scaler.scale(loss).backward()
 
         # Clip gradients
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+        group_norms = {}
+        if log_step:
+            grouped = {}
+            for name, parameter in actor.named_parameters():
+                if parameter.grad is not None:
+                    grouped.setdefault(name.split(".")[0], []).append(
+                        parameter.grad.detach().float().norm().square()
+                    )
+            group_norms = {
+                f"grad_norm/{name}": torch.stack(norms).sum().sqrt()
+                for name, norms in grouped.items()
+            }
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
 
         # Update
+        previous_scale = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
 
         # Step the lr scheduler
-        lr_scheduler.step()
+        skipped = scaler.get_scale() < previous_scale
+        if not skipped:
+            lr_scheduler.step()
+
+        if log_step:
+            metrics = {
+                "loss_total": loss.detach(),
+                "grad_norm_before_clip": grad_norm,
+                "gradient_clipped": (grad_norm > 10.0).float(),
+                "optimizer_step_skipped": float(skipped),
+                "amp_scale": scaler.get_scale(),
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "unique_data_passes": (
+                    (step_id + 1) * self.global_batch_size
+                    / self.unique_train_samples
+                ),
+                **group_norms,
+            }
+            metrics.update({
+                f"loss/{name}": value
+                for name, value in getattr(
+                    actor, "loss_diagnostics", {}
+                ).items()
+            })
+            world_size = dist.get_world_size()
+            for name, value in metrics.items():
+                value = torch.as_tensor(
+                    value, device=loss.device
+                ).detach().clone().float()
+                dist.reduce(value, dst=0)
+                if dist.get_rank() == 0:
+                    self.writer.add_scalar(
+                        f"training/{name}", value / world_size, step_id + 1
+                    )
 
     @torch.inference_mode()
     def evaluate_nsteps(self, model, loader, step_id, val_iters, split='val'):
         """Run a given number of evaluation steps."""
-        values = {}
+        accumulator = ActionValidation()
+        probes = {}
         device = next(model.parameters()).device
         model.eval()
+        # Validation runs only on rank zero; bypass DDP forward synchronization.
+        model = model.module if hasattr(model, "module") else model
 
         cuda_devices = [device.index] if device.type == "cuda" else []
         # Compare checkpoints with the same validation noise without perturbing
@@ -413,36 +499,48 @@ class BaseTrainTester:
                         sample["proprioception"].cuda(non_blocking=True)[:, :, 0]
                     )
 
-                current_openess = sample["proprioception"].cuda(
-                    non_blocking=True
-                )[:, -1:, :, -1:]
+                current_pose = sample["proprioception"].to(
+                    device, non_blocking=True
+                )[:, -1:]
                 if pred_action.ndim == 3:
-                    current_openess = current_openess[:, :, 0]
-                losses, losses_B = compute_metrics(
-                    pred_action,
-                    gt_action,
-                    current_openess=current_openess,
+                    current_pose = current_pose[:, :, 0]
+                accumulator.update(
+                    pred_action, gt_action, current_pose, sample["task"]
                 )
-
-                # Gather global statistics
-                for n, l in losses.items():
-                    key = f"{split}-losses/mean/{n}"
-                    if key not in values:
-                        values[key] = torch.Tensor([]).to(device)
-                    values[key] = torch.cat([values[key], l.unsqueeze(0)])
-
-                # Gather per-task statistics
-                tasks = np.array(sample["task"])
-                for n, l in losses_B.items():
-                    for task in np.unique(tasks):
-                        key = f"{split}-loss/{task}/{n}"
-                        l_task = l[tasks == task].mean()
-                        if key not in values:
-                            values[key] = torch.Tensor([]).to(device)
-                        values[key] = torch.cat([values[key], l_task.unsqueeze(0)])
+                if split == "val" and i < self.args.validation_probe_batches:
+                    predictions = [pred_action]
+                    # Extra trials do not alter later validation samples' RNG.
+                    with torch.random.fork_rng(devices=cuda_devices):
+                        torch.manual_seed(1000 + i)
+                        for _ in range(
+                            self.args.validation_noise_repeats - 1
+                        ):
+                            repeated = self._model_forward(
+                                model, sample, training=False
+                            )
+                            if self.args.relative_action:
+                                repeated = relative_to_absolute(
+                                    repeated[:, :, 0], current_pose
+                                )
+                            predictions.append(repeated)
+                    for name, value in noise_sensitivity(
+                        predictions
+                    ).items():
+                        probes.setdefault(name, []).append(value.item())
 
         # Log all statistics
-        values = {k: v.mean().item() for k, v in values.items()}
+        values = accumulator.summarize(split)
+        values.update({
+            f"{split}-probe/{name}": float(np.mean(items))
+            for name, items in probes.items()
+        })
+        if not accumulator.task_samples:
+            raise RuntimeError(f"No samples were evaluated for {split}.")
+        print(
+            f"{split}: evaluated {sum(accumulator.task_samples.values())} "
+            f"samples across {len(accumulator.task_samples)} tasks; "
+            "these are offline checks, not simulator success rates."
+        )
         if dist.get_rank() == 0:
             if step_id > -1:
                 for key, val in values.items():
@@ -451,16 +549,21 @@ class BaseTrainTester:
             # Also log to terminal
             print(f"Step {step_id}:")
             for key, value in values.items():
-                print(f"{key}: {value:.03f}")
+                if key.startswith((
+                    f"{split}-losses/mean/",
+                    f"{split}-diagnostics/",
+                    f"{split}-probe/",
+                )):
+                    print(f"{key}: {value:.03f}")
 
         # Select checkpoints by a task-balanced metric. A global sample mean is
         # easily dominated by coarse, high-success tasks and can improve while
         # insertion/stacking tasks remain unusable.
-        task_scores = [
-            value for key, value in values.items()
+        task_scores = {
+            key.split("/")[1]: value for key, value in values.items()
             if key.startswith(f'{split}-loss/')
             and key.endswith('/traj_score')
-        ]
+        }
         if not task_scores:
             raise RuntimeError(
                 f"No per-task trajectory scores were produced for {split}."
@@ -470,7 +573,7 @@ class BaseTrainTester:
             worst_quartile_score,
             selection_score,
         ) = compute_task_balanced_selection(
-            task_scores,
+            task_scores.values(),
             worst_fraction=0.25,
         )
         if dist.get_rank() == 0:
@@ -479,6 +582,15 @@ class BaseTrainTester:
                 f"macro={macro_score:.4f}, "
                 f"worst_quartile={worst_quartile_score:.4f}, "
                 f"combined={selection_score:.4f}"
+            )
+            worst_tasks = sorted(
+                task_scores.items(), key=lambda item: item[1], reverse=True
+            )[:5]
+            print(
+                "Worst validation tasks: "
+                + ", ".join(
+                    f"{task}={score:.4f}" for task, score in worst_tasks
+                )
             )
             if step_id > -1:
                 self.writer.add_scalar(
@@ -538,6 +650,12 @@ class BaseTrainTester:
             optimizer.load_state_dict(model_dict["optimizer"])
         start_iter = model_dict.get("iter", 0)
         best_loss = model_dict.get("best_loss", None)
+        if model_dict.get("validation_version") != 2:
+            best_loss = None
+            print(
+                "Validation now uses sample-weighted full-set metrics; "
+                "resetting the old best-score baseline."
+            )
 
         print("=> loaded successfully '{}' (step {})".format(
             self.args.checkpoint, model_dict.get("iter", 0)
@@ -557,36 +675,29 @@ class BaseTrainTester:
             if key not in {"local_rank", "log_dir"}
         }
 
-        # Best checkpoint
-        if best_loss is None or new_loss <= best_loss:
+        is_best = best_loss is None or new_loss <= best_loss
+        if is_best:
             best_loss = new_loss
-            torch.save({
-                "weight": model_state,
-                "ema_weight": ema_state,
-                "iter": step_id + 1,
-                "best_loss": best_loss,
-                "config": config,
-            }, self.args.log_dir / "best.pth")
-
-        # Last checkpoint (always saved)
-        torch.save({
+        checkpoint = {
+            "validation_version": 2,
             "weight": model_state,
             "ema_weight": ema_state,
-            "optimizer": optimizer.state_dict(),
             "iter": step_id + 1,
             "best_loss": best_loss,
             "config": config,
+        }
+        if is_best:
+            torch.save(checkpoint, self.args.log_dir / "best.pth")
+
+        # Last checkpoint (always saved)
+        torch.save({
+            **checkpoint,
+            "optimizer": optimizer.state_dict(),
         }, self.args.log_dir / "last.pth")
 
         # Save intermediate checkpoints
         if (step_id + 1) % self.args.interm_ckpt_freq == 0:
-            torch.save({
-                "weight": model_state,
-                "ema_weight": ema_state,
-                "iter": step_id + 1,
-                "best_loss": best_loss,
-                "config": config,
-            }, self.args.log_dir / f"interm{step_id + 1}.pth")
+            torch.save(checkpoint, self.args.log_dir / f"interm{step_id + 1}.pth")
 
         return best_loss
 
