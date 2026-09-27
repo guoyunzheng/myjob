@@ -4,18 +4,21 @@ import argparse
 import random
 from pathlib import Path
 import json
-import os
 
 import torch
 import numpy as np
 
-from datasets import fetch_dataset_class
-from modeling.policy import fetch_model_class
+from modeling.flow_config import (
+    add_flow_arguments, normalize_flow_arguments, flow_model_kwargs, configure_action_precision,
+)
 from utils.common_utils import str2bool, str_none, round_floats
 from utils.checkpoint_utils import load_model_state_strict
+from utils.training_checkpoint import (
+    ARCHITECTURE_FIELDS, validate_init_config, validate_normalizer, git_identity,
+)
 
 
-def parse_arguments():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser("Parse arguments for main.py")
     # Tuples: (name, type, default)
     arguments = [
@@ -29,7 +32,9 @@ def parse_arguments():
         ('gripper_open_threshold', float, 0.75),
         ('gripper_close_threshold', float, 0.25),
         ('require_pose_for_gripper_open', str2bool, True),
+        ('gripper_command_mode', str, 'hysteresis'),
         ('seed', int, 0),
+        ('matmul_precision', str, 'legacy'),
         # Dataset arguments
         ('data_dir', Path, Path(__file__).parent / "demos"),
         ('dataset', str, "Peract"),
@@ -47,7 +52,7 @@ def parse_arguments():
         ('embedding_dim', int, 144),
         ('num_attn_heads', int, 9),
         ('num_vis_instr_attn_layers', int, 2),
-        ('num_history', int, 0),
+        ('num_history', int, 1),
         # Model arguments: head
         ('num_shared_attn_layers', int, 4),
         ('action_hidden_dim', int, 256),
@@ -57,15 +62,32 @@ def parse_arguments():
         ('relative_action', str2bool, False),
         ('rotation_format', str, 'quat_xyzw'),
         ('denoise_timesteps', int, 2),
-        ('denoise_model', str, "meanflow")
+        ('denoise_model', str, None)
     ]
     for arg in arguments:
         parser.add_argument(f'--{arg[0]}', type=arg[1], default=arg[2])
 
-    return parser.parse_args()
+    add_flow_arguments(parser)
+    args = normalize_flow_arguments(parser.parse_args(argv), parser)
+    if args.matmul_precision not in ("legacy", "ieee"):
+        parser.error("matmul_precision must be legacy or ieee.")
+    if args.gripper_command_mode not in ("hysteresis", "threshold"):
+        parser.error("gripper_command_mode must be hysteresis or threshold.")
+    if not 0 <= args.gripper_close_threshold < args.gripper_open_threshold <= 1:
+        parser.error("Require 0 <= gripper_close_threshold < gripper_open_threshold <= 1.")
+    changed_thresholds = (args.gripper_close_threshold, args.gripper_open_threshold) != (0.25, 0.75)
+    if args.gripper_command_mode == "threshold" and changed_thresholds:
+        parser.error("threshold mode uses a fixed 0.5 threshold; do not set hysteresis thresholds.")
+    if (args.bimanual or "peract" not in args.dataset.lower()) and (
+        args.gripper_command_mode != "hysteresis" or changed_thresholds or not args.require_pose_for_gripper_open
+    ):
+        parser.error("Execution gripper ablations are currently implemented only for single-arm Peract.")
+    return args
 
 
 def load_models(args):
+    configure_action_precision(args.action_head, args.matmul_precision)
+    from modeling.policy import fetch_model_class
     print("Loading model from", args.checkpoint, flush=True)
 
     model_dict = torch.load(
@@ -85,6 +107,11 @@ def load_models(args):
             "Checkpoint gripper mode mismatch: trained with "
             f"{trained_gripper_mode!r}, requested {gripper_mode!r}."
         )
+    evaluation_config = dict(vars(args), gripper_prediction_mode=gripper_mode)
+    validate_init_config(
+        model_dict, evaluation_config,
+        fields=tuple(key for key in ARCHITECTURE_FIELDS if key in evaluation_config),
+    )
 
     model_class = fetch_model_class(args.model_type)
     model_kwargs = dict(
@@ -102,6 +129,13 @@ def load_models(args):
         denoise_model=args.denoise_model
     )
     if args.model_type == "denoise3d":
+        model_kwargs.update(flow_model_kwargs(args))
+        # Training objective must agree even when state-dict shapes match.
+        for field in ("action_head", "flow_objective"):
+            trained_value = checkpoint_config.get(field)
+            if trained_value is not None and trained_value != getattr(args, field):
+                raise ValueError(f"Checkpoint {field} mismatch: {trained_value!r} "
+                                 f"vs requested {getattr(args, field)!r}.")
         model_kwargs.update(
             action_hidden_dim=args.action_hidden_dim,
             action_num_blocks=args.action_num_blocks,
@@ -143,6 +177,9 @@ def load_models(args):
         else model_dict["weight"]
     )
     weight_name = "EMA" if model_dict.get("ema_weight") is not None else "raw"
+    bounds = validate_normalizer(selected_weight)
+    if "workspace_normalizer" in model_dict and not torch.equal(bounds, model_dict["workspace_normalizer"]):
+        raise ValueError("Checkpoint normalizer metadata disagrees with selected weights.")
     load_model_state_strict(
         model,
         selected_weight,
@@ -161,19 +198,41 @@ def load_models(args):
         f"gripper mode {gripper_mode})."
     )
     model.eval()
+    model.evaluation_checkpoint = {
+        "path": str(args.checkpoint), "iteration": model_dict.get("iter"),
+        "selected_weights": weight_name, "training_config": checkpoint_config,
+        "source_sha256": model_dict.get("run_metadata", {}).get("git", {}).get("source_sha256"),
+        "run_id": model_dict.get("run_metadata", {}).get("run_id"),
+        "runtime": model_dict.get("run_metadata", {}).get("runtime"),
+        "parameter_counts": model_dict.get("run_metadata", {}).get("parameter_counts"),
+        "dataset_counts": model_dict.get("run_metadata", {}).get("dataset_counts"),
+        "workspace_normalizer": bounds.tolist(),
+    }
 
     return model.cuda()
+
+
+def evaluation_metadata(args, model):
+    """Keep execution recipe alongside scores without changing their JSON schema."""
+    return {
+        "evaluation_source_sha256": git_identity(Path(__file__).resolve().parents[1])["source_sha256"],
+        "evaluation_config": {key: str(value) if isinstance(value, Path) else value
+                              for key, value in vars(args).items()},
+        "checkpoint": model.evaluation_checkpoint,
+        "execution_gripper_ablation_supported": not args.bimanual and "peract" in args.dataset.lower(),
+    }
 
 
 if __name__ == "__main__":
     # Arguments
     args = parse_arguments()
+    from datasets import fetch_dataset_class
     print("Arguments:")
     print(args)
     print("-" * 100)
 
     # Save results here
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    Path(args.output_file).parent.mkdir(parents=True, exist_ok=True)
 
     # Bimanual vs single-arm utils
     if args.bimanual:
@@ -188,6 +247,8 @@ if __name__ == "__main__":
 
     # Load models
     model = load_models(args)
+    with open(str(args.output_file) + ".config.json", "w", encoding="utf-8") as config_file:
+        json.dump(evaluation_metadata(args, model), config_file, indent=2, ensure_ascii=False)
     # print(model.workspace_normalizer)
 
     # Evaluate - reload environment for each task (crashes otherwise)
@@ -213,6 +274,7 @@ if __name__ == "__main__":
         if not args.bimanual and "peract" in args.dataset.lower():
             env_kwargs.update(
                 gripper_open_threshold=args.gripper_open_threshold,
+                gripper_command_mode=args.gripper_command_mode,
                 gripper_close_threshold=args.gripper_close_threshold,
                 require_pose_for_gripper_open=(
                     args.require_pose_for_gripper_open
@@ -243,5 +305,9 @@ if __name__ == "__main__":
         )
 
         task_success_rates[task_str] = var_success_rates
+        metadata = evaluation_metadata(args, model)
+        metadata["coverage"] = {task_str: getattr(env, "last_evaluation_coverage", None)}
+        with open(str(args.output_file) + ".config.json", "w", encoding="utf-8") as config_file:
+            json.dump(metadata, config_file, indent=2, ensure_ascii=False)
         with open(args.output_file, "w") as f:
             json.dump(round_floats(task_success_rates), f, indent=4)

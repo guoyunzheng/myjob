@@ -8,7 +8,6 @@ import open3d  # DON'T DELETE THIS!
 from tqdm import tqdm
 import numpy as np
 import torch
-import torch.nn.functional as F
 import einops
 from matplotlib import pyplot as plt
 
@@ -22,6 +21,7 @@ from pyrep.objects.dummy import Dummy
 from pyrep.objects.vision_sensor import VisionSensor
 
 from modeling.encoder.text import fetch_tokenizers
+from utils.action_contract import select_proprio_history
 from online_evaluation_rlbench.get_stored_demos import get_stored_demos
 
 
@@ -166,7 +166,7 @@ class Actioner:
             None,
             pcds,
             self._instr,
-            gripper[:, :, None, :7],
+            gripper[:, :, None, :],  # Keep openness: xyz + xyzw + open = 8.
             run_inference=True
         ).view(1, prediction_len, 8)
 
@@ -345,12 +345,7 @@ class RLBenchEnv:
                 gripper = gripper.cuda(non_blocking=True)
                 grippers = torch.cat([grippers, gripper.unsqueeze(1)], 1)
 
-                # Prepare proprioception history
-                gripper_input = grippers[:, -num_history:]
-                npad = num_history - gripper_input.shape[1]
-                gripper_input = F.pad(
-                    gripper_input, (0, 0, npad, 0), mode='replicate'
-                )
+                gripper_input = select_proprio_history(grippers, num_history, pad=True)
 
                 output = actioner.predict(
                     rgbs_input,

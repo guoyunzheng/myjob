@@ -1,5 +1,4 @@
 from copy import deepcopy
-import os
 import random
 
 import numpy as np
@@ -18,7 +17,12 @@ from ..common_utils import count_parameters
 from ..depth2cloud import fetch_depth2cloud
 from ..data_preprocessors import fetch_data_preprocessor
 from ..ema import EMA
-from ..checkpoint_utils import load_model_state_strict
+from ..training_checkpoint import (
+    read_checkpoint, config_snapshot, validate_resume, validate_init_config, validate_evaluation_config,
+    make_run_metadata, check_output_directory, write_run_manifest,
+    initialize_weights, restore_training_state, capture_rng_state,
+    restore_rng_state, build_training_checkpoint, atomic_save_checkpoint,
+)
 from ..schedulers import fetch_scheduler
 from .utils import compute_task_balanced_selection
 from .validation import ActionValidation, noise_sensitivity
@@ -33,16 +37,40 @@ class BaseTrainTester:
         self.dataset_cls = dataset_cls
         self.model_cls = model_cls
 
+        # Fail before datasets, normalizer scans, model allocations or log writes.
+        self.config = config_snapshot(args)
+        self.load_mode = "resume" if args.resume else "init" if args.init_from else "scratch"
+        source_path = args.resume or args.init_from or args.checkpoint
+        self.source_checkpoint = read_checkpoint(source_path) if source_path else None
+        if args.eval_only:
+            self.load_mode = "eval"
+        if self.load_mode == "resume":
+            validate_resume(self.source_checkpoint, self.config, dist.get_world_size())
+        elif args.eval_only:
+            validate_evaluation_config(self.source_checkpoint, self.config)
+        elif self.source_checkpoint is not None:
+            validate_init_config(self.source_checkpoint, self.config)
+        if not args.eval_only:
+            check_output_directory(args.log_dir, args.resume)
+        metadata = [make_run_metadata(self.config, self.source_checkpoint,
+                                      self.load_mode, source_path) if dist.get_rank() == 0 else None]
+        dist.broadcast_object_list(metadata, src=0)
+        self.run_metadata = metadata[0]
+        if self.load_mode == "resume":
+            old_hash = self.source_checkpoint["run_metadata"].get("git", {}).get("source_sha256")
+            new_hash = self.run_metadata["git"]["source_sha256"]
+            if old_hash and new_hash and old_hash != new_hash:
+                raise ValueError("Strict resume source-code fingerprint mismatch. "
+                                 "Use the original code or --init_from for a new experiment.")
+            if not old_hash or not new_hash:
+                print("WARNING: source fingerprint unavailable; code identity cannot be verified.")
+
         self.preprocessor = fetch_data_preprocessor(self.args.dataset)(
             self.args.keypose_only,
             self.args.num_history,
             custom_imsize=self.args.custom_img_size,
             depth2cloud=fetch_depth2cloud(self.args.dataset)
         )
-
-        if dist.get_rank() == 0 and not self.args.eval_only:
-            self.writer = SummaryWriter(log_dir=args.log_dir)
-            self.writer.add_text("run/config", str(vars(args)), 0)
 
     def get_datasets(self):
         """Initialize datasets."""
@@ -68,6 +96,7 @@ class BaseTrainTester:
 
     def get_loaders(self):
         """Initialize data loaders."""
+        from utils.reproducibility import data_seed
         def seed_worker(worker_id):
             worker_seed = torch.initial_seed() % 2**32
             np.random.seed(worker_seed)
@@ -77,8 +106,9 @@ class BaseTrainTester:
         train_dataset, val_dataset = self.get_datasets()
         # Samplers and loaders
         g = torch.Generator()
-        g.manual_seed(0)
-        train_sampler = DistributedSampler(train_dataset, drop_last=True)
+        g.manual_seed(data_seed(self.args.seed))
+        self.train_generator = g
+        train_sampler = DistributedSampler(train_dataset, drop_last=True, seed=data_seed(self.args.seed))
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.args.batch_size // self.args.chunk_size,
@@ -110,6 +140,7 @@ class BaseTrainTester:
         else:
             val_loader = None
         self.unique_train_samples = len(train_dataset.annos["action"])
+        self.validation_samples = len(val_dataset.annos["action"])
         self.global_batch_size = self.args.batch_size * dist.get_world_size()
         if dist.get_rank() == 0:
             validation_samples = len(val_dataset.annos["action"])
@@ -118,20 +149,12 @@ class BaseTrainTester:
                 f"{validation_samples} validation samples, global batch "
                 f"{self.global_batch_size}."
             )
-            if not self.args.eval_only:
-                self.writer.add_scalar(
-                    "run/unique_train_samples", self.unique_train_samples, 0
-                )
-                self.writer.add_scalar(
-                    "run/validation_samples", validation_samples, 0
-                )
-                self.writer.add_scalar(
-                    "run/global_batch_size", self.global_batch_size, 0
-                )
         return train_loader, val_loader, train_sampler
 
     def get_model(self):
         """Initialize the model."""
+        from modeling.flow_config import flow_model_kwargs
+        from modeling.loss_config import extra_loss_model_kwargs
         # Initialize model with arguments
         model_kwargs = dict(
             backbone=self.args.backbone,
@@ -151,6 +174,8 @@ class BaseTrainTester:
             lv2_batch_size=self.args.lv2_batch_size,
         )
         if self.args.model_type == "denoise3d":
+            model_kwargs.update(flow_model_kwargs(self.args))
+            model_kwargs.update(extra_loss_model_kwargs(self.args))
             model_kwargs.update(
                 action_hidden_dim=self.args.action_hidden_dim,
                 action_num_blocks=self.args.action_num_blocks,
@@ -264,25 +289,39 @@ class BaseTrainTester:
         """Run main training/testing pipeline."""
         # Get loaders
         train_loader, val_loader, train_sampler = self.get_loaders()
+        dataset_counts = {
+            "train_samples": self.unique_train_samples,
+            "validation_samples": self.validation_samples,
+        }
+        if self.load_mode == "resume":
+            saved_counts = self.source_checkpoint["run_metadata"].get("dataset_counts")
+            if saved_counts is not None and saved_counts != dataset_counts:
+                raise ValueError("Strict resume dataset sample counts changed.")
+        self.run_metadata["dataset_counts"] = dataset_counts
 
         # Get model
         model = self.get_model()
+        self.run_metadata["parameter_counts"] = {
+            "total": sum(p.numel() for p in model.parameters()),
+            "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "action_head": sum(p.numel() for p in model.prediction_head.parameters())
+            if hasattr(model, "prediction_head") else None,
+        }
         self.tokenizer = fetch_tokenizers(self.args.backbone)
-        if not os.path.exists(self.args.checkpoint):
+        if self.source_checkpoint is None:
             normalizer = self.get_workspace_normalizer()
             model.workspace_normalizer.copy_(normalizer)
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
-        # Get optimizer
+        # Move model to devices
+        if torch.cuda.is_available():
+            model = model.cuda()
+        # Build the optimizer only after parameters are on their final device.
         optimizer = self.get_optimizer(model)
         lr_scheduler = fetch_scheduler(
             self.args.lr_scheduler, optimizer, self.args.train_iters
         )
         scaler = torch.GradScaler()
-
-        # Move model to devices
-        if torch.cuda.is_available():
-            model = model.cuda()
         # make sure to compile before DDP!
         if self.args.use_compile:
             model.compute_loss = torch.compile(model.compute_loss, fullgraph=True)
@@ -297,8 +336,19 @@ class BaseTrainTester:
 
         # Check for a checkpoint
         start_iter, best_loss = 0, None
-        if self.args.checkpoint:
-            start_iter, best_loss = self.load_checkpoint(model, ema_model, optimizer)
+        self.steps_per_epoch = len(train_loader)
+        if self.steps_per_epoch < 1 and not self.args.eval_only:
+            raise ValueError("Training loader has no complete batches.")
+        if self.load_mode == "resume":
+            if self.source_checkpoint["steps_per_epoch"] != self.steps_per_epoch:
+                raise ValueError("Strict resume dataset/loader length changed.")
+            start_iter, best_loss = restore_training_state(
+                self.source_checkpoint, model, ema_model, optimizer, lr_scheduler, scaler, self.ema
+            )
+        elif self.source_checkpoint is not None:
+            selection = ("ema" if self.args.use_ema else "raw") if self.args.eval_only else self.args.init_weights
+            initialize_weights(model, ema_model, self.source_checkpoint, selection)
+        print(f"Checkpoint mode={self.load_mode}, run_id={self.run_metadata['run_id']}, step={start_iter}")
         print(model.module.workspace_normalizer)
 
         # Eval only
@@ -314,9 +364,15 @@ class BaseTrainTester:
             dist.barrier(device_ids=[torch.cuda.current_device()])
             return ema_model if self.args.use_ema else model
 
-        # Step the lr scheduler to the current step
-        for _ in range(start_iter):
-            lr_scheduler.step()
+        if dist.get_rank() == 0:
+            self.run_metadata["workspace_normalizer"] = model.module.workspace_normalizer.detach().cpu().tolist()
+            write_run_manifest(self.args.log_dir, self.run_metadata)
+            self.writer = SummaryWriter(log_dir=self.args.log_dir, purge_step=start_iter or None)
+            self.writer.add_text("run/config", str(self.config), start_iter)
+            self.writer.add_text("run/identity", str(self.run_metadata), start_iter)
+            self.writer.add_scalar("run/unique_train_samples", self.unique_train_samples, start_iter)
+            self.writer.add_scalar("run/global_batch_size", self.global_batch_size, start_iter)
+            self.writer.add_scalar("run/validation_samples", self.validation_samples, start_iter)
 
         # Step the sampler to the currect "epoch"
         samples_per_epoch = len(train_loader)
@@ -325,7 +381,21 @@ class BaseTrainTester:
 
         # Training loop
         model.train()
+        rank_state = None
+        if self.load_mode == "resume":
+            rank_state = self.source_checkpoint["rank_states"][dist.get_rank()]
+            self.train_generator.set_state(rank_state["loader_epoch_generator"].cpu())
+        self.loader_epoch_generator_state = self.train_generator.get_state()
         iter_loader = iter(train_loader)
+        if rank_state is not None:
+            # Replay the consumed batch indices, then restore training-process RNG.
+            # Persistent worker/prefetch RNG is not serializable: this is NOT a
+            # promise of bitwise-identical augmentations after a restart.
+            for _ in range(start_iter % samples_per_epoch):
+                next(iter_loader)
+            restore_rng_state(rank_state["rng"])
+            print("Restored training state and batch cursor; worker-prefetch replay is not bitwise guaranteed.")
+        self.source_checkpoint = None
         for step_id in trange(start_iter, self.args.train_iters):
             try:
                 sample = next(iter_loader)
@@ -334,6 +404,7 @@ class BaseTrainTester:
                 # and increment the epoch
                 epoch += 1
                 train_sampler.set_epoch(epoch)
+                self.loader_epoch_generator_state = self.train_generator.get_state()
                 iter_loader = iter(train_loader)
                 sample = next(iter_loader)
 
@@ -342,7 +413,9 @@ class BaseTrainTester:
             )
             self.ema.step(model, ema_model, self.args.use_ema, step_id)
 
-            if (step_id + 1) % self.args.val_freq == 0 and dist.get_rank() == 0:
+            save_due = (step_id + 1) % self.args.val_freq == 0 or step_id + 1 == self.args.train_iters
+            new_loss = None
+            if save_due and dist.get_rank() == 0:
                 print("Train evaluation.......")
                 model.eval()
                 self.evaluate_nsteps(
@@ -357,12 +430,22 @@ class BaseTrainTester:
                     val_loader, step_id,
                     val_iters=self.args.val_batches
                 )
-                # save model
-                best_loss = self.save_checkpoint(
-                    model, ema_model, optimizer, step_id,
-                    new_loss, best_loss
-                )
                 model.train()
+            if save_due:
+                state = {
+                    "rng": capture_rng_state(),
+                    "loader_epoch_generator": (
+                        self.train_generator.get_state() if (step_id + 1) % samples_per_epoch == 0
+                        else self.loader_epoch_generator_state
+                    ),
+                }
+                rank_states = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+                dist.gather_object(state, rank_states, dst=0)
+            if save_due and dist.get_rank() == 0:
+                best_loss = self.save_checkpoint(
+                    model, ema_model, optimizer, lr_scheduler, scaler, step_id,
+                    new_loss, best_loss, rank_states
+                )
             dist.barrier(device_ids=[torch.cuda.current_device()])
 
         return ema_model if self.args.use_ema else model
@@ -456,6 +539,10 @@ class BaseTrainTester:
                 for name, value in getattr(
                     actor, "loss_diagnostics", {}
                 ).items()
+            })
+            metrics.update({
+                f"flow/{name}": value
+                for name, value in getattr(actor, "flow_diagnostics", {}).items()
             })
             world_size = dist.get_world_size()
             for name, value in metrics.items():
@@ -610,94 +697,26 @@ class BaseTrainTester:
                 )
         return selection_score
 
-    def load_checkpoint(self, model, ema_model, optimizer):
-        """Load from checkpoint."""
-        print("=> trying checkpoint '{}'".format(self.args.checkpoint))
-        if not os.path.exists(self.args.checkpoint):
-            print('Warning: checkpoint was not found, starting from scratch')
-            print('The main process will compute workspace bounds')
-            return 0, None
-
-        model_dict = torch.load(
-            self.args.checkpoint,
-            map_location="cpu",
-            weights_only=True
-        )
-        precision_upgrade_prefixes = (
-            "encoder.proprio_state_encoder.",
-            "condition_pooler.relevance_score.",
-            "condition_pooler.spatial_moment_projection.",
-            "condition_pooler.secondary_relevance_score.",
-            "condition_pooler.secondary_slot_projection.",
-        )
-        load_model_state_strict(
-            model,
-            model_dict,
-            self.args.checkpoint,
-            allowed_missing_prefixes=precision_upgrade_prefixes,
-        )
-        print("All model keys matched successfully.")
-        # EMA weights
-        if model_dict.get("ema_weight") is not None:
-            load_model_state_strict(
-                ema_model,
-                model_dict["ema_weight"],
-                f"{self.args.checkpoint} (EMA)",
-                allowed_missing_prefixes=precision_upgrade_prefixes,
-            )
-        # Useful for resuming training
-        if 'optimizer' in model_dict and not self.args.eval_only:
-            optimizer.load_state_dict(model_dict["optimizer"])
-        start_iter = model_dict.get("iter", 0)
-        best_loss = model_dict.get("best_loss", None)
-        if model_dict.get("validation_version") != 2:
-            best_loss = None
-            print(
-                "Validation now uses sample-weighted full-set metrics; "
-                "resetting the old best-score baseline."
-            )
-
-        print("=> loaded successfully '{}' (step {})".format(
-            self.args.checkpoint, model_dict.get("iter", 0)
-        ))
-        del model_dict
-        torch.cuda.empty_cache()
-        return start_iter, best_loss
-
-    def save_checkpoint(self, model, ema_model, optimizer,
-                        step_id, new_loss, best_loss):
-        """Save checkpoint if requested."""
-        model_state = model.state_dict()
-        ema_state = ema_model.state_dict() if self.args.use_ema else None
-        config = {
-            key: str(value) if hasattr(value, "__fspath__") else value
-            for key, value in vars(self.args).items()
-            if key not in {"local_rank", "log_dir"}
-        }
-
+    def save_checkpoint(self, model, ema_model, optimizer, lr_scheduler, scaler,
+                        step_id, new_loss, best_loss, rank_states):
+        """Save complete, versioned training state with atomic replacement."""
         is_best = best_loss is None or new_loss <= best_loss
         if is_best:
             best_loss = new_loss
-        checkpoint = {
-            "validation_version": 2,
-            "weight": model_state,
-            "ema_weight": ema_state,
-            "iter": step_id + 1,
-            "best_loss": best_loss,
-            "config": config,
-        }
+        checkpoint = build_training_checkpoint(
+            model, ema_model, optimizer, lr_scheduler, scaler, self.ema,
+            config=self.config, run_metadata=self.run_metadata, step=step_id + 1,
+            best_loss=best_loss, rank_states=rank_states, steps_per_epoch=self.steps_per_epoch,
+        )
         if is_best:
-            torch.save(checkpoint, self.args.log_dir / "best.pth")
+            atomic_save_checkpoint(checkpoint, self.args.log_dir / "best.pth")
 
         # Last checkpoint (always saved)
-        torch.save({
-            **checkpoint,
-            "optimizer": optimizer.state_dict(),
-        }, self.args.log_dir / "last.pth")
+        atomic_save_checkpoint(checkpoint, self.args.log_dir / "last.pth")
 
         # Save intermediate checkpoints
         if (step_id + 1) % self.args.interm_ckpt_freq == 0:
-            torch.save(checkpoint, self.args.log_dir / f"interm{step_id + 1}.pth")
+            atomic_save_checkpoint(checkpoint, self.args.log_dir / f"interm{step_id + 1}.pth")
 
         return best_loss
 

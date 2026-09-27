@@ -6,7 +6,6 @@ import open3d  # DON'T DELETE THIS!
 from tqdm import tqdm
 import numpy as np
 import torch
-import torch.nn.functional as F
 import einops
 
 from rlbench.observation_config import ObservationConfig, CameraConfig
@@ -19,9 +18,10 @@ from pyrep.errors import IKError, ConfigurationPathError
 from pyrep.const import RenderMode
 
 from modeling.encoder.text import fetch_tokenizers
+from utils.action_contract import select_proprio_history
 from online_evaluation_rlbench.get_stored_demos import get_stored_demos
 from online_evaluation_rlbench.gripper_control import (
-    hysteresis_gripper_command,
+    gripper_command,
     should_execute_gripper_change,
 )
 
@@ -47,6 +47,7 @@ class Mover:
         gripper_close_threshold=0.25,
         gripper_open_threshold=0.75,
         require_pose_for_gripper_open=True,
+        gripper_command_mode="hysteresis",
     ):
         self._task = task
         self._last_action = (
@@ -55,6 +56,7 @@ class Mover:
         self._max_tries = max_tries
         self._gripper_close_threshold = gripper_close_threshold
         self._gripper_open_threshold = gripper_open_threshold
+        self._gripper_command_mode = gripper_command_mode
         self._require_pose_for_gripper_open = (
             require_pose_for_gripper_open
         )
@@ -96,11 +98,12 @@ class Mover:
             if self._last_action is not None
             else (1.0 if self.last_gripper_probability >= 0.5 else 0.0)
         )
-        target_gripper = hysteresis_gripper_command(
+        target_gripper = gripper_command(
             self.last_gripper_probability,
             current_gripper,
             close_threshold=self._gripper_close_threshold,
             open_threshold=self._gripper_open_threshold,
+            mode=self._gripper_command_mode,
         )
         target[7] = target_gripper
         self.last_gripper_command = target_gripper
@@ -218,6 +221,7 @@ class RLBenchEnv:
         gripper_close_threshold=0.25,
         gripper_open_threshold=0.75,
         require_pose_for_gripper_open=True,
+        gripper_command_mode="hysteresis",
     ):
 
         # setup required inputs
@@ -234,6 +238,9 @@ class RLBenchEnv:
             )
         self.gripper_close_threshold = gripper_close_threshold
         self.gripper_open_threshold = gripper_open_threshold
+        if gripper_command_mode not in ("hysteresis", "threshold"):
+            raise ValueError("gripper_command_mode must be hysteresis or threshold.")
+        self.gripper_command_mode = gripper_command_mode
         self.require_pose_for_gripper_open = require_pose_for_gripper_open
 
         # setup RLBench environments
@@ -316,14 +323,15 @@ class RLBenchEnv:
         task_variations = glob.glob(
             os.path.join(self.data_path, task_str, "variation*")
         )
-        task_variations = [
-            int(n.split('/')[-1].replace('variation', ''))
+        task_variations = sorted(
+            int(os.path.basename(n).replace('variation', ''))
             for n in task_variations
-        ]
+        )
 
         var_success_rates = {}
         var_success_counts = {}
         var_num_valid_demos = {}
+        var_episode_ids = {}
 
         for variation in tqdm(task_variations):
             task.set_variation(variation)
@@ -342,10 +350,19 @@ class RLBenchEnv:
             if valid:
                 var_success_counts[variation] = success_rate
                 var_num_valid_demos[variation] = num_valid_demos
+                var_episode_ids[variation] = self._last_variation_episode_ids
                 var_success_rates[variation] = success_rate / num_valid_demos
 
         self.env.shutdown()
 
+        self.last_evaluation_coverage = {
+            str(variation): {"successes": int(var_success_counts.get(variation, 0)),
+                             "episodes": int(var_num_valid_demos.get(variation, 0)),
+                             "episode_ids": var_episode_ids.get(variation, [])}
+            for variation in task_variations
+        }
+        if not var_num_valid_demos or sum(var_num_valid_demos.values()) == 0:
+            raise ValueError("No valid evaluation episodes; refusing to report a success rate.")
         var_success_rates["mean"] = (
             sum(var_success_counts.values()) /
             sum(var_num_valid_demos.values())
@@ -367,14 +384,16 @@ class RLBenchEnv:
     ):
         success_rate = 0
         total_reward = 0
-        var_demos = get_stored_demos(
+        var_demos, episode_ids = get_stored_demos(
             amount=-1,
             dataset_root=self.data_path,
             variation_number=variation,
             task_name=task_str,
             random_selection=False,
-            from_episode_number=0
+            from_episode_number=0,
+            return_identifiers=True,
         )
+        self._last_variation_episode_ids = episode_ids
 
         for demo_id, demo in enumerate(var_demos):
 
@@ -391,6 +410,7 @@ class RLBenchEnv:
                 initial_action=initial_action,
                 gripper_close_threshold=self.gripper_close_threshold,
                 gripper_open_threshold=self.gripper_open_threshold,
+                gripper_command_mode=self.gripper_command_mode,
                 require_pose_for_gripper_open=(
                     self.require_pose_for_gripper_open
                 ),
@@ -413,12 +433,9 @@ class RLBenchEnv:
                 gripper = gripper.cuda(non_blocking=True)
                 grippers = torch.cat([grippers, gripper.unsqueeze(1)], 1)
 
-                # Prepare proprioception history
-                gripper_input = grippers[:, -num_history:]
-                npad = num_history - gripper_input.shape[1]
-                gripper_input = F.pad(
-                    gripper_input, (0, 0, npad, 0), mode='replicate'
-                )
+                # Same chronological tail selection as training; repeat the
+                # earliest available state only at episode startup.
+                gripper_input = select_proprio_history(grippers, num_history, pad=True)
 
                 output = actioner.predict(
                     rgbs_input,

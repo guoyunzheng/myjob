@@ -2,8 +2,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 import einops
-from torch.func import jvp
 from ..noise_scheduler import fetch_schedulers
+from ..flow_config import resolve_flow_config
+from ..flow_objectives import fetch_flow_objective, interval_coordinates
+from ..action_context import ActionContext
+from ..transformer_action_head import TransformerActionHead
+from ..loss_config import LossConfig
+from utils.action_contract import current_proprio, validate_action_config, validate_proprio_shape
 from ..utils.position_encodings import SinusoidalPosEmb
 from .gripper_head import GripperStateHead
 from ..utils.utils import (
@@ -27,7 +32,7 @@ class DenoiseActor(nn.Module):
                  rotation_format='quat_xyzw',
                  # Denoising arguments
                  denoise_timesteps=2,
-                 denoise_model="meanflow",  
+                 denoise_model=None,
                  # Training arguments
                  lv2_batch_size=4,
                  action_hidden_dim=256,
@@ -37,11 +42,51 @@ class DenoiseActor(nn.Module):
                  endpoint_loss_weight=0.25,
                  ivc_loss_weight=0.0,
                  condition_dropout_prob=0.0,
-                 gripper_transition_weight=2.0,
-                 gripper_closed_hold_weight=2.0,
+                 gripper_transition_weight=None,
+                 gripper_closed_hold_weight=None,
                  gripper_prediction_mode="legacy_denoise",
-                 gripper_hold_prior_logit=2.0):
+                 gripper_hold_prior_logit=2.0,
+                 action_head=None,
+                 flow_objective=None,
+                 attention_backend=None,
+                 time_sampler=None,
+                 time_sampler_mean=None,
+                 time_sampler_std=None,
+                 meanflow_offdiag_ratio=None,
+                 flow_loss_type=None,
+                 pose_position_weight=30.0,
+                 pose_rotation_weight=10.0,
+                 gripper_loss_weight=1.0,
+                 gripper_loss_type="weighted_bce"):
         super().__init__()
+        validate_action_config(nhist, rotation_format, relative)
+        self._num_history = nhist
+        self._nhand = nhand
+        self.flow_config = resolve_flow_config(
+            denoise_model=denoise_model,
+            action_head=action_head,
+            flow_objective=flow_objective,
+            attention_backend=attention_backend,
+            time_sampler=time_sampler,
+            time_sampler_mean=time_sampler_mean,
+            time_sampler_std=time_sampler_std,
+            meanflow_offdiag_ratio=meanflow_offdiag_ratio,
+            flow_loss_type=flow_loss_type,
+        )
+        self.flow_objective = fetch_flow_objective(self.flow_config.flow_objective)
+        self.flow_config.validate_conditioning(guidance_scale, condition_dropout_prob)
+        self.loss_config = LossConfig(
+            pose_position_weight=pose_position_weight, pose_rotation_weight=pose_rotation_weight,
+            gripper_loss_weight=gripper_loss_weight, gripper_loss_type=gripper_loss_type,
+            gripper_transition_weight=gripper_transition_weight,
+            gripper_closed_hold_weight=gripper_closed_hold_weight,
+            gripper_hold_prior_logit=gripper_hold_prior_logit,
+            endpoint_loss_weight=endpoint_loss_weight, ivc_loss_weight=ivc_loss_weight,
+        ).validate()
+        gripper_transition_weight = self.loss_config.gripper_transition_weight
+        gripper_closed_hold_weight = self.loss_config.gripper_closed_hold_weight
+        if self.flow_config.flow_objective == "fm" and ivc_loss_weight != 0:
+            raise ValueError("FM requires ivc_loss_weight=0; its main loss already supervises velocity.")
         if not 0.0 <= condition_dropout_prob <= 1.0:
             raise ValueError("condition_dropout_prob must be in [0, 1].")
         if gripper_transition_weight < 0.0:
@@ -68,6 +113,7 @@ class DenoiseActor(nn.Module):
         self._gripper_prediction_mode = gripper_prediction_mode
         self.collect_training_diagnostics = False
         self.loss_diagnostics = {}
+        self.flow_diagnostics = {}
 
         # Vision-language encoder, runs only once
         self.encoder = None  # Implement this!
@@ -82,14 +128,22 @@ class DenoiseActor(nn.Module):
             embedding_dim=embedding_dim,
             condition_dim=action_hidden_dim,
         )
-        self.prediction_head = FiLMTemporalConvHead(
-            action_dim=action_dim,
-            hidden_dim=action_hidden_dim,
-            condition_dim=action_hidden_dim,
-            num_blocks=action_num_blocks,
-            nhand=nhand,
-            rot_dim=3 if rotation_format == 'euler' else 6,
-        )
+        if self.flow_config.action_head == "transformer":
+            self.prediction_head = TransformerActionHead(
+                token_dim=embedding_dim, hidden_dim=action_hidden_dim,
+                condition_dim=action_hidden_dim, num_heads=num_attn_heads,
+                num_blocks=action_num_blocks, nhand=nhand,
+                attention_backend=self.flow_config.attention_backend,
+            )
+        else:
+            self.prediction_head = FiLMTemporalConvHead(
+                action_dim=action_dim,
+                hidden_dim=action_hidden_dim,
+                condition_dim=action_hidden_dim,
+                num_blocks=action_num_blocks,
+                nhand=nhand,
+                rot_dim=3 if rotation_format == 'euler' else 6,
+            )
         self.gripper_state_head = (
             GripperStateHead(
                 condition_dim=action_hidden_dim,
@@ -102,7 +156,7 @@ class DenoiseActor(nn.Module):
 
         # Noise/denoise schedulers and hyperparameters
         self.position_scheduler, self.rotation_scheduler = fetch_schedulers(
-            denoise_model, denoise_timesteps
+            self.flow_config.flow_objective, denoise_timesteps, flow_config=self.flow_config
         )
         self.n_steps = denoise_timesteps
 
@@ -120,17 +174,22 @@ class DenoiseActor(nn.Module):
         self.nrm_dim = int(self.workspace_normalizer.size(-1))
 
     def encode_inputs(self, rgb3d, rgb2d, pcd, instruction, proprio):
+        validate_proprio_shape(proprio, num_history=self._num_history, nhand=self._nhand)
         instr_padding_mask = self.encoder.instruction_padding_mask(instruction)
         fixed_inputs = self.encoder(
             rgb3d, rgb2d, pcd, instruction,
             proprio.flatten(1, 2)
         )
-        # Query trajectory (for relative trajectory prediction)
-        query_trajectory = proprio[:, -1:]
-        return (query_trajectory,) + fixed_inputs + (instr_padding_mask,)
+        # Current observation also anchors the gripper branch; history is chronological.
+        query_trajectory = current_proprio(proprio)
+        result = (query_trajectory,) + fixed_inputs + (instr_padding_mask,)
+        if self.flow_config.action_head == "transformer":
+            # Preserve raw world history and hand axes until context validation.
+            result += (proprio[..., :3],)
+        return result
 
     def encode_condition(self, fixed_inputs):
-        """Pool observation tokens once, outside the action-head JVP path."""
+        """Prepare fixed observations once, outside the action-head JVP path."""
         (
             query_trajectory,
             rgb3d_feats, pcd,
@@ -139,9 +198,9 @@ class DenoiseActor(nn.Module):
             proprio_feats,
             fps_scene_feats, fps_scene_pos,
             instr_padding_mask,
-        ) = fixed_inputs
+        ) = fixed_inputs[:11]
 
-        return self.condition_pooler(
+        global_condition = self.condition_pooler(
             rgb3d_feats=rgb3d_feats,
             rgb3d_pos=pcd,
             rgb2d_feats=rgb2d_feats,
@@ -152,14 +211,34 @@ class DenoiseActor(nn.Module):
             fps_scene_feats=fps_scene_feats,
             fps_scene_pos=fps_scene_pos,
         )
+        if self.flow_config.action_head == "film_tcn":
+            return global_condition
+        if len(fixed_inputs) != 12:
+            raise ValueError("Transformer context requires world proprio history; use encode_inputs first.")
+        proprio_xyz = fixed_inputs[11]
+        if proprio_xyz.shape[1:] != (self._num_history, self._nhand, 3):
+            raise ValueError("Proprio world xyz must preserve [history, hand, 3] axes.")
+        # Keep the encoder/pooler and numerical scene mixture unchanged. Named
+        # dense/sparse groups are views of one concatenation made outside JVP.
+        return ActionContext(
+            global_condition=global_condition,
+            scene_tokens=torch.cat((rgb3d_feats, fps_scene_feats), dim=1),
+            scene_xyz=torch.cat((pcd, fps_scene_pos), dim=1),
+            language_tokens=instr_feats, language_padding_mask=instr_padding_mask,
+            proprio_tokens=proprio_feats,
+            workspace_bounds=self.workspace_normalizer[None].expand(len(global_condition), -1, -1),
+            dense_scene_count=rgb3d_feats.shape[1],
+            proprio_xyz=proprio_xyz.flatten(1, 2),
+            proprio_layout=(self._num_history, self._nhand),
+        ).validate()
 
     def policy_forward_pass(self, trajectory, timestep1, timestep2, condition):
         # Accept the old fixed-input tuple as a convenience for external callers.
-        if not torch.is_tensor(condition):
+        if not torch.is_tensor(condition) and not isinstance(condition, ActionContext):
             condition = self.encode_condition(condition)
         # The Transformer/Flash encoder remains under BF16 autocast, but the
-        # compact FiLM-TCN directly emits normalized metric actions. Keeping
-        # this small head in FP32 prevents millimeter-scale corrections from
+        # action decoder directly emits normalized metric actions. Keeping
+        # this head in FP32 prevents millimeter-scale corrections from
         # being quantized before either the loss or the MeanFlow integration.
         with torch.autocast(
             device_type=trajectory.device.type,
@@ -178,6 +257,8 @@ class DenoiseActor(nn.Module):
             raise RuntimeError(
                 "Direct gripper prediction requested in legacy_denoise mode."
             )
+        if isinstance(condition, ActionContext):
+            condition = condition.global_condition
         with torch.autocast(
             device_type=condition.device.type,
             enabled=False,
@@ -188,10 +269,12 @@ class DenoiseActor(nn.Module):
         return logits
 
     def compute_gripper_loss(self, logits, target_openess, current_openess):
-        """Cost-sensitive BCE that protects a closed gripper during transport."""
+        """Plain or cost-sensitive BCE; effectiveness must be measured in ablations."""
         elementwise_loss = F.binary_cross_entropy_with_logits(
             logits.float(), target_openess.float(), reduction='none'
         )
+        if self.loss_config.gripper_loss_type == "bce":
+            return self.loss_config.gripper_loss_weight * elementwise_loss.mean()
         target_is_open = target_openess.float() >= 0.5
         current_is_open = current_openess.float() >= 0.5
         transition = (target_is_open != current_is_open).to(
@@ -205,12 +288,14 @@ class DenoiseActor(nn.Module):
             + self._gripper_transition_weight * transition
             + self._gripper_closed_hold_weight * closed_hold
         )
-        return (elementwise_loss * weights).sum() / weights.sum().clamp_min(1.0)
+        loss = (elementwise_loss * weights).sum() / weights.sum().clamp_min(1.0)
+        return self.loss_config.gripper_loss_weight * loss
 
     def denoise_trajectory(
         self, trajectory, condition, guidance_scale=1.0, uncond_condition=None
     ):
         """Shared differentiable solver for inference and endpoint supervision."""
+        self.flow_config.validate_conditioning(guidance_scale)
         self.position_scheduler.set_timesteps(self.n_steps, device=trajectory.device)
         self.rotation_scheduler.set_timesteps(self.n_steps, device=trajectory.device)
         for t, r in zip(
@@ -218,12 +303,13 @@ class DenoiseActor(nn.Module):
             self.position_scheduler.prev_timesteps,
         ):
             batch_r, batch_t = r.expand(len(trajectory)), t.expand(len(trajectory))
+            field_r, field_t = self.flow_objective.prediction_times(batch_r, batch_t)
             out = self.policy_forward_pass(
-                trajectory, batch_r, batch_t, condition
+                trajectory, field_r, field_t, condition
             )[-1]
             if guidance_scale != 1.0:
                 out_uncond = self.policy_forward_pass(
-                    trajectory, batch_r, batch_t, uncond_condition
+                    trajectory, field_r, field_t, uncond_condition
                 )[-1]
                 out = out_uncond + guidance_scale * (out - out_uncond)
             pos = self.position_scheduler.step(
@@ -249,7 +335,7 @@ class DenoiseActor(nn.Module):
                 uncond_fixed_inputs = uncond_inputs
             uncond_condition = (
                 uncond_fixed_inputs
-                if torch.is_tensor(uncond_fixed_inputs)
+                if torch.is_tensor(uncond_fixed_inputs) or isinstance(uncond_fixed_inputs, ActionContext)
                 else self.encode_condition(uncond_fixed_inputs)
             )
 
@@ -316,7 +402,7 @@ class DenoiseActor(nn.Module):
 
         gt_openess = gt_trajectory[..., -1:]
         gt_position_world = gt_trajectory[..., :3].float()
-        current_openess = proprio[:, -1:, :, -1:].float()
+        current_openess = current_proprio(proprio)[..., -1:].float()
         gt_trajectory = self.normalize_pos(gt_trajectory[..., :-1])
         traj_len = gt_trajectory.shape[1]
         gt_trajectory = self.convert_rot(gt_trajectory)
@@ -348,7 +434,7 @@ class DenoiseActor(nn.Module):
             noisy_trajectory = torch.cat((pos, rot), dim=-1)
             velocity = noise - gt_trajectory
 
-            u_target = self.compute_meanflow_target(
+            u_target = self.compute_flow_target(
                 noisy_trajectory,
                 r,
                 t,
@@ -356,8 +442,21 @@ class DenoiseActor(nn.Module):
                 condition.detach(),
             )
 
+            # iMF's target is fixed noise-data; the detached correction belongs
+            # to the prediction. Never use the training velocity as its tangent.
+            correction = None
+            if self.flow_objective.name == "imf":
+                correction = self.flow_objective.prediction_correction(
+                    self.pose_velocity_field, noisy_trajectory, r, t, condition,
+                    microbatch_size=self._jvp_microbatch_size,
+                )
+                if diagnostics is not None:
+                    record('imf_correction_rms', correction.square().mean().sqrt())
+                    record('imf_offdiag_fraction', (r != t).float().mean())
+
+            field_r, field_t = self.flow_objective.prediction_times(r, t)
             prediction = self.policy_forward_pass(
-                noisy_trajectory, r, t, condition
+                noisy_trajectory, field_r, field_t, condition
             )
             loss_ivc = self.compute_ivc_loss(
                 noisy_trajectory, r, t, velocity, condition
@@ -367,12 +466,15 @@ class DenoiseActor(nn.Module):
 
             for layer_prediction in prediction:
                 u_prediction = layer_prediction[..., :-1].float()
-                loss_position = 30 * F.l1_loss(
+                if correction is not None:
+                    u_prediction = u_prediction + correction
+                regression_loss = F.mse_loss if self.flow_config.flow_loss_type == "l2" else F.l1_loss
+                loss_position = self.loss_config.pose_position_weight * regression_loss(
                     u_prediction[..., :3],
                     u_target[..., :3],
                     reduction='mean',
                 )
-                loss_rotation = 10 * F.l1_loss(
+                loss_rotation = self.loss_config.pose_rotation_weight * regression_loss(
                     u_prediction[..., 3:],
                     u_target[..., 3:],
                     reduction='mean',
@@ -416,6 +518,11 @@ class DenoiseActor(nn.Module):
         if diagnostics is not None:
             self.loss_diagnostics = {
                 name: value / self._lv2_batch_size for name, value in diagnostics.items()
+                if not name.startswith('imf_')
+            }
+            self.flow_diagnostics = {
+                name: value / self._lv2_batch_size for name, value in diagnostics.items()
+                if name.startswith('imf_')
             }
             if direct_gripper_loss is not None:
                 self.loss_diagnostics['gripper'] = direct_gripper_loss.detach()
@@ -424,7 +531,7 @@ class DenoiseActor(nn.Module):
     def compute_endpoint_loss(self, noise, condition, gt_position_world, gt_trajectory):
         """Supervise the same multi-step rollout executed at evaluation."""
         reconstruction, _ = self.denoise_trajectory(noise.float(), condition)
-        position_loss = 30 * F.smooth_l1_loss(
+        position_loss = self.loss_config.pose_position_weight * F.smooth_l1_loss(
             self.unnormalize_pos(reconstruction)[..., :3],
             gt_position_world,
             beta=0.005,
@@ -438,7 +545,7 @@ class DenoiseActor(nn.Module):
         rotation_cosine = (
             (pred_rotation * gt_rotation).sum(dim=(-1, -2)) - 1.0
         ) * 0.5
-        rotation_loss = 10 * (1.0 - rotation_cosine.clamp(-1.0, 1.0)).mean()
+        rotation_loss = self.loss_config.pose_rotation_weight * (1.0 - rotation_cosine.clamp(-1.0, 1.0)).mean()
         if self.collect_training_diagnostics:
             self.endpoint_loss_diagnostics = {
                 'endpoint_position': position_loss.detach(),
@@ -450,75 +557,30 @@ class DenoiseActor(nn.Module):
         """Supervise u(z_t, t, t) only for samples drawn with r != t.
 
         Diagonal samples already receive velocity supervision from the main
-        MeanFlow loss (with L1 rather than this auxiliary MSE). For off-diagonal
+        flow loss (L1 or L2; this auxiliary term remains MSE). For off-diagonal
         samples, evaluate a separate diagonal prediction: u(z_t, r, t) is an
         average velocity and must retain its MeanFlow target. Keep gradients
         through the selected condition features as well as the action head.
         """
         if self._ivc_loss_weight == 0:
             return z.new_zeros((), dtype=torch.float32)
-        # The sampler sets r=t exactly. Preserve even very short nonzero
-        # intervals instead of discarding them using an isclose tolerance.
-        mask = r != t
-        if not mask.any():
-            return z.new_zeros((), dtype=torch.float32)
-        diagonal_t = t[mask]
-        diagonal_prediction = self.policy_forward_pass(
-            z[mask], diagonal_t, diagonal_t, condition[mask]
-        )[-1][..., :-1].float()
-        return F.mse_loss(diagonal_prediction, velocity[mask].float())
+        return self.flow_objective.ivc_loss(self.pose_velocity_field, z, r, t, velocity, condition)
+
+    def pose_velocity_field(self, z, r, t, condition):
+        """Exclude the non-integrated gripper logit from the vector field."""
+        return self.policy_forward_pass(z, r, t, condition)[-1][..., :-1]
+
+    def compute_flow_target(self, z, r, t, velocity, condition):
+        return self.flow_objective.target(
+            self.pose_velocity_field, z, r, t, velocity, condition,
+            microbatch_size=self._jvp_microbatch_size,
+        )
 
     def compute_meanflow_target(self, z, r, t, velocity, condition):
-        """Construct the stop-gradient target using the exact MeanFlow JVP.
-
-        The characteristic direction is ``(dz, dr, dt) = (velocity, 0, 1)``.
-        Chunking applies only to the target computation; the trainable forward
-        above still uses the complete optimizer batch.
-        """
-        batch_size = z.shape[0]
-        chunk_size = self._jvp_microbatch_size
-        if chunk_size is None or chunk_size <= 0:
-            chunk_size = batch_size
-
-        directional_derivatives = []
-        # ``torch.func.jvp`` is exact AD, but it still inherits the outer BF16
-        # autocast. Run the compact FiLM-TCN target pass in FP32 so small action
-        # differences are not quantized before the derivative is formed.
-        device_type = z.device.type
-        with torch.no_grad(), torch.autocast(device_type=device_type, enabled=False):
-            for start in range(0, batch_size, chunk_size):
-                end = min(start + chunk_size, batch_size)
-                z_chunk = z[start:end].float()
-                r_chunk = r[start:end].float()
-                t_chunk = t[start:end].float()
-                velocity_chunk = velocity[start:end].float()
-                condition_chunk = condition[start:end].float()
-
-                def action_field(z_in, r_in, t_in):
-                    return self.policy_forward_pass(
-                        z_in, r_in, t_in, condition_chunk
-                    )[-1][..., :-1]
-
-                _, derivative = jvp(
-                    action_field,
-                    (z_chunk, r_chunk, t_chunk),
-                    (
-                        velocity_chunk,
-                        torch.zeros_like(r_chunk),
-                        torch.ones_like(t_chunk),
-                    ),
-                )
-                directional_derivatives.append(derivative)
-
-        total_derivative = torch.cat(
-            directional_derivatives, dim=0
-        ).float()
-        delta = (r - t).view(
-            [t.size(0)] + [1] * (total_derivative.dim() - 1)
-        ).float()
-        return (
-            velocity.float() + delta * total_derivative
-        ).detach()
+        """Compatibility wrapper for callers explicitly requesting MeanFlow."""
+        if self.flow_config.flow_objective != "meanflow":
+            raise ValueError("compute_meanflow_target is only valid for flow_objective=meanflow.")
+        return self.compute_flow_target(z, r, t, velocity, condition)
 
     def normalize_pos(self, signal):
         _min = self.workspace_normalizer[0]
@@ -588,12 +650,11 @@ class DenoiseActor(nn.Module):
             rgb2d: (B, num_2d_cameras, 3, H, W) in [0, 1]
             pcd: (B, num_3d_cameras, 3, H, W) in world coordinates
             instruction: tokenized text instruction
-            proprio: (B, nhist, nhand, 3+4+X)
+            proprio: (B, nhist, nhand, 8), oldest to current; xyz+xyzw+open
 
         Note:
-            The input rotation is expressed either as:
-                a) quaternion (4D), then the model converts it to 6D internally.
-                b) Euler angles (3D).
+            RLBench inputs/outputs are absolute world poses with xyzw quaternion.
+            Action rotations are converted to continuous 6D internally.
 
         Returns:
             - loss: scalar, if run_inference is False
@@ -905,11 +966,12 @@ class FiLMTemporalConvHead(nn.Module):
     def _encode_condition(self, r, t, condition):
         r = r.reshape(condition.shape[0])
         t = t.reshape(condition.shape[0])
+        end_time, interval = interval_coordinates(r, t)
         time_features = torch.cat(
             (
                 self.time_embedding(r),
-                self.time_embedding(t),
-                self.time_embedding(t - r),
+                self.time_embedding(end_time),
+                self.time_embedding(interval),
             ),
             dim=-1,
         )

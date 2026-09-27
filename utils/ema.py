@@ -37,6 +37,17 @@ class EMA:
     def copy_weights(self, new_model, ema_model):
         ema_model.load_state_dict(new_model.state_dict())
 
+    def state_dict(self):
+        return {name: getattr(self, name) for name in (
+            "update_after_step", "inv_gamma", "power", "min_value", "max_value"
+        )}
+
+    def load_state_dict(self, state):
+        if set(state) != set(self.state_dict()):
+            raise ValueError("Incomplete or incompatible EMA configuration.")
+        for name, value in state.items():
+            setattr(self, name, value)
+
     def get_decay(self, optimization_step):
         """Compute the decay factor."""
         step = max(0, optimization_step - self.update_after_step - 1)

@@ -5,7 +5,6 @@ import random
 from tqdm import tqdm
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from rlbench.observation_config import ObservationConfig, CameraConfig
 from rlbench.environment import Environment
@@ -17,6 +16,7 @@ from pyrep.errors import IKError, ConfigurationPathError
 from pyrep.const import RenderMode
 
 from modeling.encoder.text import fetch_tokenizers
+from utils.action_contract import select_proprio_history
 from online_evaluation_rlbench.get_stored_demos import get_stored_demos
 
 
@@ -273,12 +273,7 @@ class RLBenchEnv:
                 gripper = gripper.cuda(non_blocking=True)
                 grippers = torch.cat([grippers, gripper.unsqueeze(1)], 1)
 
-                # Prepare proprioception history
-                gripper_input = grippers[:, -num_history:]
-                npad = num_history - gripper_input.shape[1]
-                gripper_input = F.pad(
-                    gripper_input, (0, 0, npad, 0), mode='replicate'
-                )
+                gripper_input = select_proprio_history(grippers, num_history, pad=True)
 
                 output = actioner.predict(
                     rgbs_input,

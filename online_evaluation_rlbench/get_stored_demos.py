@@ -13,7 +13,8 @@ def get_stored_demos(amount=1,
                      variation_number=0,
                      task_name='close_jar',
                      random_selection=False,
-                     from_episode_number=0):
+                     from_episode_number=0,
+                     return_identifiers=False):
 
     task_root = join(dataset_root, task_name)
     if not exists(task_root):
@@ -62,4 +63,4 @@ def get_stored_demos(amount=1,
             obs.variation_number = variation_number
 
         demos.append(obs)
-    return demos
+    return (demos, list(selected_examples)) if return_identifiers else demos

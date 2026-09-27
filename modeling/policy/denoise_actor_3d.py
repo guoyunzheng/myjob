@@ -23,7 +23,7 @@ class DenoiseActor(BaseDenoiseActor):
                  rotation_format='quat_xyzw',
                  # Denoising arguments
                  denoise_timesteps=2,
-                 denoise_model="meanflow",
+                 denoise_model=None,
                  # Training arguments
                  lv2_batch_size=1,
                  action_hidden_dim=256,
@@ -33,10 +33,22 @@ class DenoiseActor(BaseDenoiseActor):
                  endpoint_loss_weight=0.25,
                  ivc_loss_weight=0.0,
                  condition_dropout_prob=0.0,
-                 gripper_transition_weight=2.0,
-                 gripper_closed_hold_weight=2.0,
+                 gripper_transition_weight=None,
+                 gripper_closed_hold_weight=None,
                  gripper_prediction_mode="direct",
-                 gripper_hold_prior_logit=2.0):
+                 gripper_hold_prior_logit=2.0,
+                 action_head=None,
+                 flow_objective=None,
+                 attention_backend=None,
+                 time_sampler=None,
+                 time_sampler_mean=None,
+                 time_sampler_std=None,
+                 meanflow_offdiag_ratio=None,
+                 flow_loss_type=None,
+                 pose_position_weight=30.0,
+                 pose_rotation_weight=10.0,
+                 gripper_loss_weight=1.0,
+                 gripper_loss_type="weighted_bce"):
         super().__init__(
             embedding_dim=embedding_dim,
             num_attn_heads=num_attn_heads,
@@ -59,6 +71,18 @@ class DenoiseActor(BaseDenoiseActor):
             gripper_closed_hold_weight=gripper_closed_hold_weight,
             gripper_prediction_mode=gripper_prediction_mode,
             gripper_hold_prior_logit=gripper_hold_prior_logit,
+            action_head=action_head,
+            flow_objective=flow_objective,
+            attention_backend=attention_backend,
+            time_sampler=time_sampler,
+            time_sampler_mean=time_sampler_mean,
+            time_sampler_std=time_sampler_std,
+            meanflow_offdiag_ratio=meanflow_offdiag_ratio,
+            flow_loss_type=flow_loss_type,
+            pose_position_weight=pose_position_weight,
+            pose_rotation_weight=pose_rotation_weight,
+            gripper_loss_weight=gripper_loss_weight,
+            gripper_loss_type=gripper_loss_type,
         )
 
         # Vision-language encoder, runs only once

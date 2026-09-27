@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 
@@ -5,15 +7,24 @@ class MFScheduler:
     """MeanFlow time sampling and integration from noise (t=1) to data (t=0).
 
     The actor constructs the exact JVP target; this scheduler supplies
-    logit-normal (t, r) pairs, linear interpolation and solver steps.
+    configurable (t, r) pairs, linear interpolation and solver steps.
     """
 
-    def __init__(self, noise_sampler="logit_normal", noise_sampler_config=None):
+    def __init__(self, noise_sampler="logit_normal", noise_sampler_config=None,
+                 meanflow_r_ne_t_ratio=0.25):
+        if noise_sampler not in ("logit_normal", "uniform"):
+            raise ValueError("noise_sampler must be logit_normal or uniform.")
         self.noise_sampler = noise_sampler
         self.noise_sampler_config = (
-            {} if noise_sampler_config is None else noise_sampler_config
+            {} if noise_sampler_config is None else dict(noise_sampler_config)
         )
-        self.meanflow_r_ne_t_ratio = 0.25
+        mean = self.noise_sampler_config.get('mean', 0.0)
+        std = self.noise_sampler_config.get('std', 1.5)
+        if not math.isfinite(mean) or not math.isfinite(std) or std <= 0:
+            raise ValueError("Sampler mean must be finite and std finite and positive.")
+        if not 0.0 <= meanflow_r_ne_t_ratio <= 1.0:
+            raise ValueError("meanflow_r_ne_t_ratio must be in [0, 1].")
+        self.meanflow_r_ne_t_ratio = meanflow_r_ne_t_ratio
 
     def set_timesteps(self, num_inference_steps, device='cpu'):
         """Build descending t and r values; the final r is zero."""
@@ -33,8 +44,12 @@ class MFScheduler:
         std = self.noise_sampler_config.get('std', 1.5)
         r_samples = torch.empty(num_noise, device=device, dtype=torch.float32)
         t_samples = torch.empty_like(r_samples)
-        r_samples = r_samples.normal_(mean=mean, std=std).sigmoid()
-        t_samples = t_samples.normal_(mean=mean, std=std).sigmoid()
+        if self.noise_sampler == "logit_normal":
+            r_samples = r_samples.normal_(mean=mean, std=std).sigmoid()
+            t_samples = t_samples.normal_(mean=mean, std=std).sigmoid()
+        else:
+            r_samples.uniform_()
+            t_samples.uniform_()
         t = torch.maximum(r_samples, t_samples)
         r = torch.minimum(r_samples, t_samples)
 

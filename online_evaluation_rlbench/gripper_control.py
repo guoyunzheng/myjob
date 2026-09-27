@@ -1,6 +1,20 @@
 """Pure gripper-command helpers shared by RLBench evaluation and checks."""
 
 
+def gripper_command(open_probability, current_state, close_threshold=0.25,
+                    open_threshold=0.75, mode="hysteresis"):
+    """Explicit execution ablation; threshold mode has no state-dependent band."""
+    if mode == "hysteresis":
+        return hysteresis_gripper_command(open_probability, current_state, close_threshold, open_threshold)
+    if mode != "threshold":
+        raise ValueError("gripper_command_mode must be hysteresis or threshold.")
+    if (close_threshold, open_threshold) != (0.25, 0.75):
+        raise ValueError("threshold mode uses 0.5; do not supply custom hysteresis thresholds.")
+    if not 0.0 <= float(open_probability) <= 1.0:
+        raise ValueError("open_probability must be in [0, 1].")
+    return 1.0 if float(open_probability) >= 0.5 else 0.0
+
+
 def hysteresis_gripper_command(
     open_probability,
     current_state,

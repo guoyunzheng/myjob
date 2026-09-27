@@ -33,47 +33,55 @@ def align_module_prefix(state, expected_keys):
     return state
 
 
-def load_model_state_strict(
+def validate_model_state(
     model,
     checkpoint,
     checkpoint_name="checkpoint",
     allowed_missing_prefixes=(),
 ):
-    """Load weights and reject every unapproved architecture difference.
+    """Preflight weights without mutating any model parameters.
 
     ``allowed_missing_prefixes`` is reserved for explicitly zero-initialized,
     behavior-preserving upgrade layers. It must never be used for a prediction
     head or another layer whose random initialization would alter inference.
     """
     state = extract_weight_state(checkpoint)
-    state = align_module_prefix(state, model.state_dict().keys())
-    try:
-        incompatible = model.load_state_dict(state, strict=False)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"{checkpoint_name} is incompatible with the requested model architecture. "
-            "Refusing to evaluate or resume with randomly initialized missing layers.\n"
-            f"{exc}"
-        ) from exc
+    expected = model.state_dict()
+    state = align_module_prefix(state, expected.keys())
 
     def allowed(key):
         key = key.removeprefix("module.")
         return any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
 
-    missing = [key for key in incompatible.missing_keys if not allowed(key)]
-    if missing or incompatible.unexpected_keys:
+    missing = [key for key in expected if key not in state and not allowed(key)]
+    unexpected = [key for key in state if key not in expected]
+    mismatched = [key for key in expected if key in state and (
+        not hasattr(state[key], "shape") or state[key].shape != expected[key].shape
+    )]
+    if missing or unexpected or mismatched:
         details = []
         if missing:
             details.append(f"Missing keys: {missing}")
-        if incompatible.unexpected_keys:
-            details.append(f"Unexpected keys: {incompatible.unexpected_keys}")
+        if unexpected:
+            details.append(f"Unexpected keys: {unexpected}")
+        if mismatched:
+            details.append(f"Shape/type mismatch: {mismatched}")
         raise RuntimeError(
             f"{checkpoint_name} is incompatible with the requested model architecture. "
             "Refusing to evaluate or resume with randomly initialized layers.\n"
             + "\n".join(details)
         )
 
-    approved_missing = [key for key in incompatible.missing_keys if allowed(key)]
+    return state
+
+
+def load_model_state_strict(model, checkpoint, checkpoint_name="checkpoint",
+                            allowed_missing_prefixes=()):
+    state = validate_model_state(
+        model, checkpoint, checkpoint_name, allowed_missing_prefixes
+    )
+    incompatible = model.load_state_dict(state, strict=False)
+    approved_missing = incompatible.missing_keys
     if approved_missing:
         print(
             "Initialized behavior-preserving precision upgrade layers: "

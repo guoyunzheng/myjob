@@ -1,3 +1,6 @@
+from utils.action_contract import select_proprio_history
+
+
 class DataPreprocessor:
 
     def __init__(self, keypose_only=False, num_history=1,
@@ -17,11 +20,9 @@ class DataPreprocessor:
     def process_proprio(self, proprio):
         """Proprio shape: (B, nhist, nhand, 3+rot+1)."""
         proprio = proprio.cuda(non_blocking=True)
-        nhist_ = proprio.size(1)
-        assert nhist_ >= self.num_history, "not enough proprio timesteps"
-        # the first proprio is the current state
-        proprio = proprio[:, :max(self.num_history, 1)]
-        return proprio
+        # Zarr stores [oldest, ..., current], as does online observation history.
+        # Taking the prefix would drop the current pose for num_history=1/2.
+        return select_proprio_history(proprio, self.num_history)
 
     def process_obs(self, rgbs, pcds):
         pass
