@@ -291,6 +291,7 @@ class TrainingResumeChecks(unittest.TestCase):
                 scheduler.step()
 
             def evaluate_nsteps(self, *args, **kwargs):
+                self.evaluated_steps = getattr(self, "evaluated_steps", []) + [args[2]]
                 return 0.3
 
         with tempfile.TemporaryDirectory() as tmp, patch("torch.cuda.current_device", return_value=0), \
@@ -324,6 +325,18 @@ class TrainingResumeChecks(unittest.TestCase):
             initialized.main()
             self.assertEqual([step for step, _ in initialized.seen], [0, 1, 2])
             self.assertNotEqual(initialized.run_metadata["run_id"], original.run_metadata["run_id"])
+            # Milestones must trigger validation/saving between normal evaluations,
+            # and the final checkpoint must not overwrite the earlier snapshot.
+            milestones = Trainer(args_for("milestones", [
+                "--val_freq", "3", "--interm_ckpt_freq", "100",
+                "--milestone_ckpt_steps", "2,3",
+            ]), None, None)
+            milestones.main()
+            self.assertEqual(milestones.evaluated_steps, [1, 1, 2, 2])
+            for saved_step in (2, 3):
+                full = read_checkpoint(Path(tmp) / f"milestones/step{saved_step}.pth")
+                self.assertEqual(full["iter"], saved_step)
+                validate_resume(full, milestones.config, 1)
 
 
 if __name__ == "__main__":

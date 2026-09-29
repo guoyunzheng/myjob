@@ -23,7 +23,7 @@ CHECKPOINT_VERSION = 2
 OPERATIONAL_FIELDS = {
     "resume", "init_from", "init_weights", "checkpoint", "eval_only",
     "base_log_dir", "exp_log_dir", "run_log_dir", "log_dir", "local_rank",
-    "diagnostic_interval", "interm_ckpt_freq",
+    "diagnostic_interval", "interm_ckpt_freq", "milestone_ckpt_steps",
 }
 ARCHITECTURE_FIELDS = (
     "model_type", "backbone", "embedding_dim", "num_attn_heads",

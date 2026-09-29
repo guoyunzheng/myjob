@@ -1,4 +1,5 @@
 from copy import deepcopy
+import json
 import random
 
 import numpy as np
@@ -413,7 +414,12 @@ class BaseTrainTester:
             )
             self.ema.step(model, ema_model, self.args.use_ema, step_id)
 
-            save_due = (step_id + 1) % self.args.val_freq == 0 or step_id + 1 == self.args.train_iters
+            completed_steps = step_id + 1
+            save_due = (
+                completed_steps % self.args.val_freq == 0
+                or completed_steps == self.args.train_iters
+                or completed_steps in self.args.milestone_ckpt_steps
+            )
             new_loss = None
             if save_due and dist.get_rank() == 0:
                 print("Train evaluation.......")
@@ -695,6 +701,32 @@ class BaseTrainTester:
                     selection_score,
                     step_id,
                 )
+            completed_steps = step_id + 1
+            if split == "val" and (
+                step_id == -1
+                or completed_steps == self.args.train_iters
+                or completed_steps in self.args.milestone_ckpt_steps
+            ):
+                name = "evaluation.json" if step_id == -1 else f"validation_step{completed_steps}.json"
+                checkpoint_name = (
+                    str(self.args.checkpoint) if step_id == -1 else
+                    f"step{completed_steps}.pth" if completed_steps in self.args.milestone_ckpt_steps else "last.pth"
+                )
+                report = {
+                    "step": None if step_id == -1 else completed_steps,
+                    "checkpoint": checkpoint_name,
+                    "flow_objective": self.args.flow_objective,
+                    "denoise_timesteps": self.args.denoise_timesteps,
+                    "weights": "ema" if self.args.use_ema else "raw",
+                    "selection_score": selection_score,
+                    "macro_score": macro_score,
+                    "worst_quartile_score": worst_quartile_score,
+                    "metrics": values,
+                    "evaluation_type": "offline_action_validation",
+                }
+                report_path = self.args.log_dir / name
+                report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                print(f"Validation report: {report_path}")
         return selection_score
 
     def save_checkpoint(self, model, ema_model, optimizer, lr_scheduler, scaler,
@@ -717,6 +749,11 @@ class BaseTrainTester:
         # Save intermediate checkpoints
         if (step_id + 1) % self.args.interm_ckpt_freq == 0:
             atomic_save_checkpoint(checkpoint, self.args.log_dir / f"interm{step_id + 1}.pth")
+
+        if step_id + 1 in self.args.milestone_ckpt_steps:
+            path = self.args.log_dir / f"step{step_id + 1}.pth"
+            atomic_save_checkpoint(checkpoint, path)
+            print(f"Retained milestone checkpoint: {path}")
 
         return best_loss
 

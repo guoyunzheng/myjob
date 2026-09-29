@@ -25,7 +25,8 @@ diagnostic_interval=${DIAGNOSTIC_INTERVAL:-100}
 val_batches=${VAL_BATCHES:--1}
 validation_noise_repeats=${VALIDATION_NOISE_REPEATS:-3}
 validation_probe_batches=${VALIDATION_PROBE_BATCHES:-4}
-eval_only=false
+eval_only=${EVAL_ONLY:-false}
+milestone_ckpt_steps=${MILESTONE_CKPT_STEPS:-}
 lr=${LEARNING_RATE:-1e-4}
 backbone_lr=1e-6  # doesn't matter when we don't finetune
 lr_scheduler=cosine
@@ -113,11 +114,25 @@ run_log_dir=${RUN_LOG_DIR:-$recipe_dir-g$gripper_prediction_mode-$gripper_loss_t
 resume=${RESUME:-}
 init_from=${INIT_FROM:-}
 init_weights=${INIT_WEIGHTS:-raw}
+checkpoint=${CHECKPOINT:-}
 if [[ -n "$resume" && -n "$init_from" ]]; then
     echo "RESUME and INIT_FROM are mutually exclusive." >&2
     exit 2
 fi
 checkpoint_args=()
+if [[ -n "$milestone_ckpt_steps" ]]; then
+    checkpoint_args+=(--milestone_ckpt_steps "$milestone_ckpt_steps")
+fi
+if [[ "$eval_only" == "true" ]]; then
+    if [[ -z "$checkpoint" || -n "$resume" || -n "$init_from" ]]; then
+        echo "EVAL_ONLY=true requires CHECKPOINT and cannot use RESUME or INIT_FROM." >&2
+        exit 2
+    fi
+    checkpoint_args+=(--checkpoint "$checkpoint")
+elif [[ -n "$checkpoint" ]]; then
+    echo "Use CHECKPOINT with EVAL_ONLY=true; use INIT_FROM or RESUME for training." >&2
+    exit 2
+fi
 if [[ -n "${SEED:-}" ]]; then
     checkpoint_args+=(--seed "$SEED")
 fi

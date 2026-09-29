@@ -97,8 +97,8 @@ guidance_scale=${GUIDANCE_SCALE:-1.0}
 relative_action=false
 rotation_format=quat_xyzw
 denoise_timesteps=${DENOISE_TIMESTEPS:-2}
-denoise_model=meanflow
-checkpoint_alias=${CHECKPOINT_ALIAS:-my_awesome_peract_model-s${denoise_timesteps}-g${guidance_scale}-grip${gripper_close_threshold}-${gripper_open_threshold}-openpose${require_pose_for_gripper_open}}
+denoise_model=${DENOISE_MODEL:-meanflow}
+checkpoint_alias=${CHECKPOINT_ALIAS:-my_awesome_peract_model-${denoise_model}-s${denoise_timesteps}-g${guidance_scale}-grip${gripper_close_threshold}-${gripper_open_threshold}-openpose${require_pose_for_gripper_open}}
 
 num_ckpts=${#tasks[@]}
 for ((i=0; i<$num_ckpts; i++)); do

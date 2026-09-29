@@ -14,6 +14,17 @@ from utils.common_utils import str2bool, str_none
 from utils.training_checkpoint import normalize_checkpoint_arguments
 
 
+def checkpoint_steps(value):
+    """Parse explicit update numbers at which to validate and retain weights."""
+    try:
+        steps = tuple(sorted(set(int(item.strip()) for item in value.split(',') if item.strip())))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('checkpoint steps must be comma-separated integers') from error
+    if any(step <= 0 for step in steps):
+        raise argparse.ArgumentTypeError('checkpoint steps must be positive')
+    return steps
+
+
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser("Parse arguments for main.py")
     # Tuples: (name, type, default)
@@ -100,6 +111,8 @@ def parse_arguments(argv=None):
                          help='Initialize matching model weights only; start a new run at step 0.')
     loading.add_argument('--init_weights', choices=('raw', 'ema'), default='raw',
                          help='Which weights to use with --init_from (default: raw).')
+    loading.add_argument('--milestone_ckpt_steps', type=checkpoint_steps, default=(),
+                         help='Comma-separated updates to validate and retain as step<N>.pth, even between regular validations.')
     args = normalize_flow_arguments(parser.parse_args(argv), parser)
     args = normalize_loss_arguments(args, parser)
     args = normalize_checkpoint_arguments(args, parser)
@@ -115,6 +128,10 @@ def parse_arguments(argv=None):
         parser.error('validation_probe_batches must be non-negative')
     if args.val_batches != -1 and args.val_batches < 1:
         parser.error('val_batches must be -1 or positive')
+    if args.train_iters < 1 or args.val_freq < 1 or args.interm_ckpt_freq < 1:
+        parser.error('train_iters, val_freq and interm_ckpt_freq must be positive')
+    if not args.eval_only and any(step > args.train_iters for step in args.milestone_ckpt_steps):
+        parser.error('milestone_ckpt_steps cannot exceed train_iters')
     return args
 
 

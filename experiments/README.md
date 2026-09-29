@@ -1,5 +1,7 @@
 # Step 8: four-cell flow comparison
 
+For the reusable FM 240k checkpoint, FM 300k comparison and 60k MeanFlow fine-tuning workflow, see [FM_TO_MEANFLOW.md](FM_TO_MEANFLOW.md).
+
 Step 9's opt-in iMF objective is documented in [IMF.md](IMF.md). It does not change this four-cell matrix or automatically launch additional runs.
 
 This prepares **FiLM-TCN/FM, FiLM-TCN/MeanFlow, Transformer/FM, Transformer/MeanFlow**.
